@@ -1,11 +1,13 @@
 import abc
 from typing import Any
 
+import torch
+
 
 class Verifier(abc.ABC):
 
     @abc.abstractmethod
-    def get_reward(self, *args, **kwargs) -> Any:
+    def get_reward(self, prompt: str | list[str], image) -> Any:
         """
         Given a prompt/image/noise as input (among other parameters),
         computes the reward given by the verifier.

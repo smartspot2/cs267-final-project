@@ -1,10 +1,86 @@
-from .base import Searcher
+from typing import Any, Optional
+
+import numpy as np
+import torch
+from rich.progress import Progress, track
+from tqdm import tqdm
+
+import utils.device
+from denoisers.base import Denoiser
+from models.base import PretrainedModel
+from utils.log import progress_columns
 from verifiers.base import Verifier
+
+from .base import Searcher
 
 
 class RandomSearch(Searcher):
-    def search(self, n_samples: int):
+    def __init__(
+        self,
+        denoiser: Denoiser,
+        verifier: Verifier,
+        denoising_steps: int,
+        num_samples: int,
+        max_batch_size: int,
+    ):
         """
-        Generates N random samples, and pick the best one according to the verifier.
+        Instantiates a new search configuration.
+
+        Parameters
+        ----------
+        denoiser: Denoiser
+            Denoiser to use in the search process.
+        verifier : Verifier
+            Verifier to use to evaluate denoised images.
+        denoising_steps : int
+            Number of steps in the denoising procedure for the search.
+        num_samples : int
+            Number of samples to evaluate.
         """
-        pass
+
+        super().__init__(denoiser, verifier, denoising_steps)
+
+        self.num_samples = num_samples
+        self.max_batch_size = max_batch_size
+
+    @torch.no_grad
+    def search(
+        self,
+        noise_shape: tuple[int, ...],
+        prompt: str,
+        *,
+        init_noise_sigma: float = 1,
+        denoiser_kwargs: Optional[dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """
+        Generates N random samples of noise, and picks the best K according to the verifier.
+
+        Runs the denoising process on each of the random noise samples,
+        and evaluates each noise with the verifier.
+        Given the desired noise shape, `noise_shape[0]` gives the desired batch size (K),
+        so we pick the top K initial noises to return.
+        """
+        if denoiser_kwargs is None:
+            denoiser_kwargs = {}
+
+        batch_size = noise_shape[0]
+        new_noise_shape = (self.num_samples, *noise_shape)
+        candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
+
+        # for each candidate noise, pass it through the model to evaluate
+        scores = []
+        for noise_batch in tqdm(candidate_noises, desc="Searching over noises"):
+            denoised = self.denoiser.denoise(noise_batch, prompt, **denoiser_kwargs)
+            for noise, image in zip(noise_batch, denoised):
+                score = self.verifier.get_reward(prompt, image)
+                scores.append((score, noise.detach()))
+                print(score)
+            del denoised
+            torch.cuda.empty_cache()
+
+        sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
+        print("Best scores:")
+        print([t[0] for t in sorted_scores[:batch_size]])
+        best_noises = [t[1] for t in sorted_scores[:batch_size]]
+
+        return torch.stack(best_noises, dim=0)

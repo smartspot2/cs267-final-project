@@ -1,4 +1,4 @@
-import ImageReward as RM  # from image-reward package (https://github.com/THUDM/ImageReward)
+import ImageReward as RM
 
 from .base import Verifier
 

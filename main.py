@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import torch
 
 import utils.device
-from denoisers import DDPMDenoiser
+from denoisers import DDPMDenoiser,ParadigmsDenoiser
 from models.stable_diffusion import StableDiffusionModel
 from searchers import NoSearch, RandomSearch
 from verifiers.image_reward import ImageRewardVerifier
@@ -13,34 +13,44 @@ SEED = 0x280
 def main():
 
     num_prompts = 1
-    num_images_per_prompt = 4
-    prompt = "Lighthouse"
+    num_images_per_prompt = 2
+    prompt = "Lighthouse, in a photorealistic style"
     height = 256
     width = 256
 
+    parallel = 1
+
     # search params`
-    num_search_inference_steps = 10
-    num_search_samples = 12
-    search_denoiser_kwargs = {
-        "height": height,
-        "width": width,
-        "num_inference_steps": num_search_inference_steps,
-        "num_images_per_prompt": num_images_per_prompt,
-    }
+    num_search_inference_steps = 50
+    num_search_samples = 4
 
     # inference params
     num_inference_steps = 50
 
+    # kwargs dicts
+    denoiser_kwargs = {
+        "height": height,
+        "width": width,
+        "num_inference_steps": num_inference_steps,
+        "num_images_per_prompt": num_images_per_prompt,
+        "parallel": parallel
+    }
+    search_denoiser_kwargs = {
+        **denoiser_kwargs,
+        "num_inference_steps": num_search_inference_steps
+    }
+
     model = StableDiffusionModel()
     verifier = ImageRewardVerifier()
-    denoiser = DDPMDenoiser(model)
+    # denoiser = DDPMDenoiser(model)
+    denoiser = ParadigmsDenoiser(model)
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)
     searcher = RandomSearch(
         denoiser,
         verifier,
         denoising_steps=num_search_inference_steps,
         num_samples=num_search_samples,
-        max_batch_size=8,
+        max_batch_size=4,
     )
 
     with torch.no_grad():
@@ -58,10 +68,7 @@ def main():
         denoised = denoiser.denoise(
             initial_noise,
             prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            num_images_per_prompt=num_images_per_prompt,
+            **denoiser_kwargs
         )
 
         print(denoised)

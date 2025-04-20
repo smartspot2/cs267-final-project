@@ -4,6 +4,7 @@ import torch
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from rich.progress import Progress
 
+import utils.cache
 import utils.device
 from models.base import PretrainedModel
 from utils.log import progress_columns
@@ -19,7 +20,7 @@ class DDPMDenoiser(Denoiser):
         super().__init__(model)
 
         self.scheduler = DDPMScheduler().from_pretrained(
-            model.model_id, subfolder="scheduler"
+            model.model_id, subfolder="scheduler", cache_dir=utils.cache.CACHE_DIR
         )
 
     def denoise(
@@ -215,6 +216,7 @@ class DDPMDenoiser(Denoiser):
                 #         guidance_rescale=guidance_rescale,
                 #     )
 
+                # TODO: this adds noise, which we don't have control over
                 # compute the previous noisy sample x_t -> x_t-1
                 latents: torch.Tensor = self.scheduler.step(
                     noise_pred,

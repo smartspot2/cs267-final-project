@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 import torch
@@ -5,6 +6,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     StableDiffusionPipeline,
 )
 
+import utils.cache
 import utils.device
 
 from .base import PretrainedModel
@@ -14,9 +16,9 @@ class StableDiffusionModel(PretrainedModel):
     model_id = "stabilityai/stable-diffusion-2-base"
 
     def __init__(self):
-        self.pipeline = StableDiffusionPipeline.from_pretrained(self.model_id).to(
-            utils.device.DEVICE
-        )
+        self.pipeline = StableDiffusionPipeline.from_pretrained(
+            self.model_id, cache_dir=utils.cache.CACHE_DIR
+        ).to(utils.device.DEVICE)
         self.pipeline.unet.eval()
         self.pipeline.enable_xformers_memory_efficient_attention()
 

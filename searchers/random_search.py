@@ -67,9 +67,29 @@ class RandomSearch(Searcher):
         new_noise_shape = (self.num_samples, *noise_shape)
         candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
 
+        # max_batch_size should be a multiple of batch_size
+        assert self.max_batch_size % batch_size == 0
+
+        final_batch_size = min(self.num_samples * batch_size, self.max_batch_size)
+
+        # total noises should either be less than the max, or it should evenly divide into splits of the max size
+        assert (
+            final_batch_size < self.max_batch_size
+            or final_batch_size % self.max_batch_size == 0
+        )
+
+        # modify the number of images per prompt
+        scale = final_batch_size // batch_size
+        num_images_per_prompt = denoiser_kwargs.get("num_images_per_prompt", 1) * scale
+        denoiser_kwargs["num_images_per_prompt"] = num_images_per_prompt
+
         # for each candidate noise, pass it through the model to evaluate
         scores = []
-        for noise_batch in tqdm(candidate_noises, desc="Searching over noises"):
+        for noise_batch in tqdm(
+            candidate_noises.flatten(0, 1).split(self.max_batch_size),
+            desc="Searching over noises",
+        ):
+            print(noise_batch.shape)
             denoised = self.denoiser.denoise(noise_batch, prompt, **denoiser_kwargs)
             for noise, image in zip(noise_batch, denoised):
                 score = self.verifier.get_reward(prompt, image)

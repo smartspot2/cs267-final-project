@@ -5,6 +5,7 @@ import torch
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     StableDiffusionPipeline,
 )
+from torch.nn.parallel import DistributedDataParallel
 
 import utils.cache
 import utils.device
@@ -15,11 +16,25 @@ from .base import PretrainedModel
 class StableDiffusionModel(PretrainedModel):
     model_id = "stabilityai/stable-diffusion-2-base"
 
-    def __init__(self):
+    def __init__(self, distributed=False):
+        super().__init__(distributed=distributed)
+
         self.pipeline = StableDiffusionPipeline.from_pretrained(
             self.model_id, cache_dir=utils.cache.CACHE_DIR
         ).to(utils.device.DEVICE)
+
+        if self.distributed:
+            # replace models with a distributed version via pytorch
+            # TODO: handle chunking?
+            device_ids = [utils.device.DEVICE.index]
+            self.unet = DistributedDataParallel(
+                self.pipeline.unet, device_ids=device_ids
+            )
+        else:
+            self.unet = self.pipeline.unet
+
         self.pipeline.unet.eval()
+        self.pipeline.vae.eval()
         self.pipeline.enable_xformers_memory_efficient_attention()
 
     @torch.no_grad
@@ -31,7 +46,7 @@ class StableDiffusionModel(PretrainedModel):
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
     ):
         # the unet from the model is used for denoising
-        model_output = self.pipeline.unet(
+        model_output = self.unet(
             latent_model_input,
             timestep,
             encoder_hidden_states=encoder_hidden_states,

@@ -7,7 +7,7 @@ from verifiers.base import Verifier
 
 
 class Searcher(abc.ABC):
-    def __init__(self, denoiser: Denoiser, verifier: Verifier, denoising_steps: int):
+    def __init__(self, denoiser: Denoiser, verifier: Verifier, denoising_steps: int, *, distributed=False):
         """
         Instantiates a new search configuration.
 
@@ -24,6 +24,8 @@ class Searcher(abc.ABC):
         self.denoiser = denoiser
         self.verifier = verifier
         self.denoising_steps = denoising_steps
+
+        self.distributed = distributed
 
     def generate_noise(self, noise_shape: tuple[int, ...], init_noise_sigma: float = 1):
         """

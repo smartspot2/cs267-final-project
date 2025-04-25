@@ -1,13 +1,18 @@
 import torch
 
+from .distributed import get_device
+
 DEVICE = None
 
 
-def init():
+def init(distributed=False):
     global DEVICE
 
     if torch.cuda.is_available():
-        DEVICE = torch.device("cuda")
+        if distributed:
+            DEVICE = get_device()
+        else:
+            DEVICE = torch.device("cuda")
     else:
         raise RuntimeError("CUDA not available")
 

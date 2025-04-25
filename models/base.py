@@ -11,6 +11,9 @@ class PretrainedModel(abc.ABC):
     model_id: str
     pipeline: DiffusionPipeline
 
+    def __init__(self, distributed=False):
+        self.distributed = distributed
+
     @abc.abstractmethod
     def forward(
         self,

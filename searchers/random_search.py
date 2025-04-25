@@ -1,7 +1,8 @@
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from rich.progress import Progress, track
 from tqdm import tqdm
 
@@ -22,6 +23,8 @@ class RandomSearch(Searcher):
         denoising_steps: int,
         num_samples: int,
         max_batch_size: int,
+        *,
+        distributed=False,
     ):
         """
         Instantiates a new search configuration.
@@ -36,11 +39,19 @@ class RandomSearch(Searcher):
             Number of steps in the denoising procedure for the search.
         num_samples : int
             Number of samples to evaluate.
+            If distributed, this is the _total_ number of samples across all GPUs;
+            the number of samples searched by this process will be num_samples / num_ranks
+        distributed : bool
+            Whether the search should be distributed.
         """
 
-        super().__init__(denoiser, verifier, denoising_steps)
+        super().__init__(denoiser, verifier, denoising_steps, distributed=distributed)
 
-        self.num_samples = num_samples
+        if distributed:
+            assert num_samples % dist.get_world_size() == 0
+            self.num_samples = num_samples // dist.get_world_size()
+        else:
+            self.num_samples = num_samples
         self.max_batch_size = max_batch_size
 
     @torch.no_grad
@@ -76,7 +87,7 @@ class RandomSearch(Searcher):
         assert (
             final_batch_size < self.max_batch_size
             or final_batch_size % self.max_batch_size == 0
-        )
+        ), f"Final batch size ({final_batch_size}) must be smaller or evenly divide the max batch size ({self.max_batch_size})"
 
         # modify the number of images per prompt
         scale = final_batch_size // batch_size
@@ -90,17 +101,86 @@ class RandomSearch(Searcher):
             desc="Searching over noises",
         ):
             print(noise_batch.shape)
+
+            # print("Memory before denoise:")
+            # print(torch.cuda.memory_summary(utils.device.DEVICE))
+
             denoised = self.denoiser.denoise(noise_batch, prompt, **denoiser_kwargs)
             for noise, image in zip(noise_batch, denoised):
                 score = self.verifier.get_reward(prompt, image)
-                scores.append((score, noise.detach()))
+                # store using numpy to avoid using more GPU memory
+                scores.append((score, utils.device.to_numpy(noise)))
                 print(score)
             del denoised
             torch.cuda.empty_cache()
 
-        sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
-        print("Best scores:")
-        print([t[0] for t in sorted_scores[:batch_size]])
-        best_noises = [t[1] for t in sorted_scores[:batch_size]]
+            # print("Memory after denoise:")
+            # print(torch.cuda.memory_summary(utils.device.DEVICE))
 
-        return torch.stack(best_noises, dim=0)
+        sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
+        best_scores = sorted_scores[:batch_size]
+
+        print("Best scores:")
+        print([t[0] for t in best_scores])
+        best_noises = [t[1] for t in best_scores]
+
+        if not self.distributed:
+            return torch.stack(best_noises, dim=0)
+
+        # if distributed, then we need to gather and get the k largest again
+        n_ranks = dist.get_world_size()
+
+        cur_rank_noises_np = np.stack([noise for (_, noise) in best_scores], axis=0)
+
+        cur_rank_noises = torch.tensor(cur_rank_noises_np, device=utils.device.DEVICE)
+        cur_rank_scores = torch.tensor(
+            [score for (score, _) in best_scores], device=utils.device.DEVICE
+        )
+
+        gathered_noises = None
+        gathered_scores = None
+        if dist.get_rank() == 0:
+            gathered_noises = [
+                torch.zeros(
+                    (len(best_scores), *noise_shape[1:]), device=utils.device.DEVICE
+                )
+                for _ in range(n_ranks)
+            ]
+            gathered_scores = [
+                torch.zeros((len(best_scores),), device=utils.device.DEVICE)
+                for _ in range(n_ranks)
+            ]
+
+        # gather all noises to the first rank
+        dist.gather(cur_rank_noises, gathered_noises, dst=0)
+        # gather all scores to the first rank
+        dist.gather(cur_rank_scores, gathered_scores, dst=0)
+
+
+        if dist.get_rank() == 0:
+            # concatenate gathered scores and noises
+            gathered_scores = torch.cat(gathered_scores)
+            gathered_noises = torch.cat(gathered_noises)
+
+            print("Gathered scores", gathered_scores)
+
+            scores = [
+                (score.item(), noise)
+                for score, noise in zip(
+                    cast(torch.Tensor, gathered_scores),
+                    cast(torch.Tensor, gathered_noises),
+                )
+            ]
+
+            sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
+            print("Best scores:")
+            print([t[0] for t in sorted_scores[:batch_size]])
+            best_noises = [t[1] for t in sorted_scores[:batch_size]]
+
+            return torch.stack(best_noises, dim=0)
+
+        # return zeros if not the first rank
+        # return torch.zeros((batch_size, *noise_shape[1:]), device=utils.device.DEVICE)
+
+        # return none of not the first rank
+        return None

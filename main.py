@@ -36,13 +36,13 @@ def prepare_fp_kwargs(config=None):
     if config is None:
         # Default configuration if none provided
         config = {
-            "pretrained_model_name_or_path": "runwayml/stable-diffusion-v1-5",
+            "pretrained_model_name_or_path": "stabilityai/stable-diffusion-2-base",
             "torch_dtype": "auto"
         }
     
     # Extract the model name from config (copy to avoid modifying original)
     config_copy = config.copy()
-    pipeline_name = config_copy.pop("pretrained_model_name_or_path", "runwayml/stable-diffusion-v1-5")
+    pipeline_name = config_copy.pop("pretrained_model_name_or_path", "stabilityai/stable-diffusion-2-base")
     
     # Get torch dtype from config
     torch_dtype_str = config_copy.pop("torch_dtype", "auto")
@@ -101,7 +101,18 @@ def main():
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
-    denoiser = DiffusionPipelineDenoiser(DiffusionPipeline.from_pretrained(**fp_kwargs, cache_dir="cache").to(("cuda:0" if torch.cuda.is_available() else "cpu")))
+    
+    config = {
+        "pretrained_model_name_or_path": "stabilityai/stable-diffusion-2-base",
+        # "torch_dtype": "fp16",
+        "pipeline_call_args": {
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps
+        }
+    }
+    fp_kwargs = prepare_fp_kwargs(config)
+    denoiser = DiffusionPipelineDenoiser(DiffusionPipeline.from_pretrained(**fp_kwargs).to(("cuda:0" if torch.cuda.is_available() else "cpu")))
     # denoiser = ParadigmsDenoiser(model)
     print("Loaded denoiser")
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)

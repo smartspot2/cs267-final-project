@@ -7,15 +7,15 @@ from denoisers import DDIMDenoiser, ParadigmsDenoiser
 from models.stable_diffusion import StableDiffusionModel
 from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
-from verifiers.image_reward import ImageRewardVerifier
+from verifiers import ImageRewardVerifier, QwenVerifier
 
 SEED = 0x280
 
 
 def main(
     prompt="a beautiful castle, matte painting",
-    num_inference_steps=50,
-    num_search_inference_steps=20,
+    num_inference_steps=5,
+    num_search_inference_steps=10,
     # total number of search samples among all processes
     num_search_samples=16,
     only_load_models=False,
@@ -125,7 +125,7 @@ def main(
                 plt.show()
 
     try_barrier(device=utils.device.DEVICE)
-
+    
     # must synchronize before computing timings
     torch.cuda.synchronize()
     print(
@@ -135,6 +135,17 @@ def main(
         print(
             f"[rank {cur_rank}] Denoise time {EVENT_denoise_start.elapsed_time(EVENT_denoise_end)}ms"
         )
+        
+    # Running the QWEN verifier on the denoised images
+    if only_load_models or dist.get_rank() == 0:
+        print("Running QWEN evaluator...")
+        # exit early if we are only loading models and not the main process
+        evaluator = QwenVerifier(seed=SEED)
+        print("Loaded Evaluator")
+        
+    eval_outputs = evaluator.get_reward(prompts=[prompt] * len(denoised), images=denoised)
+    print("Evaluation scores:", eval_outputs)
+    print("Simplified scores:", {k: v['score'] for k, v in eval_outputs[0].items()})
 
 
 if __name__ == "__main__":
@@ -148,19 +159,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-inference-steps",
         type=int,
-        default=50,
+        default=10,
         help="Number of inference steps for final denoising",
     )
     parser.add_argument(
         "--num-search-inference-steps",
         type=int,
-        default=20,
+        default=5,
         help="Number of inference steps for search denoising",
     )
     parser.add_argument(
         "--num-search-samples",
         type=int,
-        default=16,
+        default=1,
         help="Total number of search samples (evenly distributed among processes)",
     )
 

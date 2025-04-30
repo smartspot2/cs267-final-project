@@ -39,19 +39,14 @@ class RandomSearch(Searcher):
             Number of steps in the denoising procedure for the search.
         num_samples : int
             Number of samples to evaluate.
-            If distributed, this is the _total_ number of samples across all GPUs;
-            the number of samples searched by this process will be num_samples / num_ranks
+            If distributed, this is the number of samples for _this_ GPU.
         distributed : bool
             Whether the search should be distributed.
         """
 
         super().__init__(denoiser, verifier, denoising_steps, distributed=distributed)
 
-        if distributed:
-            assert num_samples % dist.get_world_size() == 0
-            self.num_samples = num_samples // dist.get_world_size()
-        else:
-            self.num_samples = num_samples
+        self.num_samples = num_samples
         self.max_batch_size = max_batch_size
 
     @torch.no_grad
@@ -74,43 +69,43 @@ class RandomSearch(Searcher):
         if denoiser_kwargs is None:
             denoiser_kwargs = {}
 
-        batch_size = noise_shape[0]
-        new_noise_shape = (self.num_samples, *noise_shape)
-        candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
-
-        # max_batch_size should be a multiple of batch_size
-        assert self.max_batch_size % batch_size == 0
-
-        final_batch_size = min(self.num_samples * batch_size, self.max_batch_size)
-
-        # total noises should either be less than the max, or it should evenly divide into splits of the max size
+        batch_size, *noise_shape_rest = noise_shape
         assert (
-            final_batch_size < self.max_batch_size
-            or final_batch_size % self.max_batch_size == 0
-        ), f"Final batch size ({final_batch_size}) must be smaller or evenly divide the max batch size ({self.max_batch_size})"
+            self.num_samples >= batch_size
+        ), "Number of search samples must be at least the desired batch size for the final denoising"
 
-        # modify the number of images per prompt
-        scale = final_batch_size // batch_size
-        num_images_per_prompt = denoiser_kwargs.get("num_images_per_prompt", 1) * scale
-        denoiser_kwargs["num_images_per_prompt"] = num_images_per_prompt
+        new_noise_shape = (self.num_samples, *noise_shape_rest)
+        candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
 
         # for each candidate noise, pass it through the model to evaluate
         scores = []
         for noise_batch in tqdm(
-            candidate_noises.flatten(0, 1).split(self.max_batch_size),
+            candidate_noises.split(self.max_batch_size),
             desc="Searching over noises",
         ):
-            print(noise_batch.shape)
-
             # print("Memory before denoise:")
             # print(torch.cuda.memory_summary(utils.device.DEVICE))
+            print(noise_batch.shape)
 
-            denoised = self.denoiser.denoise(noise_batch, prompt, **denoiser_kwargs)
-            for noise, image in zip(noise_batch, denoised):
+            denoised = self.denoiser.denoise(
+                noise_batch,
+                prompt,
+                **denoiser_kwargs,
+                # number of images per prompt should match the noise batch size
+                num_images_per_prompt=noise_batch.shape[0],
+            )
+
+            # convert to numpy to conserve on GPU memory
+            noise_batch_np = utils.device.to_numpy(noise_batch)
+            del noise_batch
+            torch.cuda.empty_cache()
+
+            for noise, image in zip(noise_batch_np, denoised):
                 score = self.verifier.get_reward(prompt, image)
                 # store using numpy to avoid using more GPU memory
-                scores.append((score, utils.device.to_numpy(noise)))
+                scores.append((score, noise))
                 print(score)
+
             del denoised
             torch.cuda.empty_cache()
 
@@ -155,7 +150,6 @@ class RandomSearch(Searcher):
         dist.gather(cur_rank_noises, gathered_noises, dst=0)
         # gather all scores to the first rank
         dist.gather(cur_rank_scores, gathered_scores, dst=0)
-
 
         if dist.get_rank() == 0:
             # concatenate gathered scores and noises

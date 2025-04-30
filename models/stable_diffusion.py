@@ -15,6 +15,7 @@ from .base import PretrainedModel
 
 class StableDiffusionModel(PretrainedModel):
     model_id = "stabilityai/stable-diffusion-2-base"
+    # model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
     def __init__(self, distributed=False):
         super().__init__(distributed=distributed)

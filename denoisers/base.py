@@ -13,7 +13,7 @@ class Denoiser(abc.ABC):
     @abc.abstractmethod
     def denoise(
         self,
-        initial_latents: torch.Tensor,
+        latents: torch.Tensor,
         prompt: Union[str, list[str]],
         height: int,
         width: int,

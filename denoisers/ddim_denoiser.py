@@ -1,7 +1,7 @@
 from typing import Any, List, Optional, Union
 
 import torch
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from rich.progress import Progress
 
 import utils.cache
@@ -12,20 +12,20 @@ from utils.log import progress_columns
 from .base import Denoiser
 
 
-class DDPMDenoiser(Denoiser):
+class DDIMDenoiser(Denoiser):
     def __init__(
         self,
         model: PretrainedModel,
     ):
         super().__init__(model)
 
-        self.scheduler = DDPMScheduler().from_pretrained(
+        self.scheduler = DDIMScheduler().from_pretrained(
             model.model_id, subfolder="scheduler", cache_dir=utils.cache.CACHE_DIR
         )
 
     def denoise(
         self,
-        initial_latents: torch.Tensor,
+        latents: torch.Tensor,
         prompt: Union[str, list[str]],
         height: int,
         width: int,
@@ -60,13 +60,13 @@ class DDPMDenoiser(Denoiser):
         """
         # 1. Check inputs. Raise error if not correct
         self.model.pipeline.check_inputs(
-            prompt,
-            height,
-            width,
-            None,  # callback_steps
-            negative_prompt,
-            prompt_embeds,
-            negative_prompt_embeds,
+            prompt=prompt,
+            height=height,
+            width=width,
+            callback_steps=None,  # callback_steps
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             ip_adapter_image=None,
             ip_adapter_image_embeds=None,
             callback_on_step_end_tensor_inputs=None,
@@ -146,8 +146,8 @@ class DDPMDenoiser(Denoiser):
         # )
 
         # quick check to ensure the initial latent noise is of the right dimensino
-        assert initial_latents.shape[0] == batch_size * num_images_per_prompt
-        latents = initial_latents.to(device)
+        assert latents.shape[0] == batch_size * num_images_per_prompt
+        latents = latents.to(device)
 
         # 6. Prepare extra step kwargs.
         # extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)

@@ -5,9 +5,11 @@ import torch
 from denoisers.base import Denoiser
 from verifiers.base import Verifier
 
+from diffusers import DiffusionPipeline
+
 
 class Searcher(abc.ABC):
-    def __init__(self, denoiser: Denoiser, verifier: Verifier, denoising_steps: int, *, distributed=False):
+    def __init__(self, pipeline: DiffusionPipeline, verifier: Verifier, *, distributed=False):
         """
         Instantiates a new search configuration.
 
@@ -21,10 +23,8 @@ class Searcher(abc.ABC):
             Number of steps in the denoising procedure for the search.
 
         """
-        self.denoiser = denoiser
+        self.pipeline = pipeline
         self.verifier = verifier
-        self.denoising_steps = denoising_steps
-
         self.distributed = distributed
 
     def generate_noise(self, noise_shape: tuple[int, ...], init_noise_sigma: float = 1):

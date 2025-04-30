@@ -9,12 +9,18 @@ from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
 from verifiers.image_reward import ImageRewardVerifier
 
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    StableDiffusionPipeline,
+)
+
+
 SEED = 0x280
+DISTRIBUTED = False
 
 
 def main():
     num_prompts = 1
-    num_images_per_prompt = 2
+    num_images_per_prompt = 1
     prompt = "A cat on the surface of the moon"
     height = 768
     width = 768
@@ -22,11 +28,11 @@ def main():
     parallel = 1
 
     # search params`
-    num_search_inference_steps = 50
-    num_search_samples = 8
+    num_search_inference_steps = 10
+    num_search_samples = 1
 
     # inference params
-    num_inference_steps = 50
+    num_inference_steps = 10
 
     # kwargs dicts
     denoiser_kwargs = {
@@ -41,21 +47,32 @@ def main():
         "num_inference_steps": num_search_inference_steps,
     }
 
-    model = StableDiffusionModel(distributed=True)
+    # model = StableDiffusionModel(distributed=True)
+    device = utils.device.DEVICE
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
     # denoiser = DDPMDenoiser(model)
-    denoiser = ParadigmsDenoiser(model)
+    # denoiser = ParadigmsDenoiser (model)
+    # Get scheduler from pipeline
+    pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-base", cache_dir=utils.cache.CACHE_DIR).to(device)
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+    print(pipe)
+    print(pipe.scheduler)
+    print(pipe.scheduler.timesteps)
+    # Disable progress bar for cleaner output
+    pipe.set_progress_bar_config(disable=False)
+    
     print("Loaded denoiser")
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)
     searcher = RandomSearch(
-        denoiser,
+        pipe,
         verifier,
         denoising_steps=num_search_inference_steps,
         num_samples=num_search_samples,
+        num_images_per_prompt=num_images_per_prompt,
         max_batch_size=32,
-        distributed=True,
+        distributed=DISTRIBUTED,
     )
     print("Loaded searcher")
 
@@ -70,12 +87,12 @@ def main():
         # search for the initial noise
         print("Searching noise...")
         initial_noise = searcher.search(
-            noise_shape=model.initial_latent_size(
-                num_prompts, num_images_per_prompt, height, width
-            ),
+            # noise_shape=model.initial_latent_size(
+            #     num_prompts, num_images_per_prompt, height, width
+            # ),
             prompt=prompt,
-            init_noise_sigma=denoiser.scheduler.init_noise_sigma,
-            denoiser_kwargs=search_denoiser_kwargs,
+            init_noise_sigma=pipe.scheduler.init_noise_sigma,
+            pipeline_kwargs=search_denoiser_kwargs,
         )
 
         # broadcast the best initial noise across all GPUs
@@ -84,14 +101,15 @@ def main():
         try_barrier(device=utils.device.DEVICE)
 
         # TODO: parallelize denoising across the GPUs
-        if dist.get_rank() == 0:
+        if not DISTRIBUTED or dist.get_rank() == 0:
             print("Performing final denoise...")
             # generate the output given the initial noise
-            denoised = denoiser.denoise(initial_noise, prompt, **denoiser_kwargs)
+            #denoised = denoiser.denoise(initial_noise, prompt, **denoiser_kwargs)
+            batched_prompts = [prompt] * num_images_per_prompt
+            result = pipe(prompt=batched_prompts, latents=initial_noise, height = height, width = width)
+            #print(denoised)
 
-            print(denoised)
-
-            for idx, image in enumerate(denoised):
+            for idx, image in enumerate(result.images):
                 reward = verifier.get_reward(prompt, image)
                 print(f"Image {idx} score:", reward)
                 plt.imshow(image)
@@ -102,21 +120,21 @@ def main():
 
 if __name__ == "__main__":
 
-    # initialize distributed workers
-    rank, n_ranks = init_workers()
-    print(f"Initialized rank {rank} out of {n_ranks}")
+    # # initialize distributed workers
+    # rank, n_ranks = init_workers()
+    # print(f"Initialized rank {rank} out of {n_ranks}")
 
-    # initialize the current device
-    utils.device.init(distributed=True)
+    # # initialize the current device
+    utils.device.init(distributed=DISTRIBUTED)
 
-    torch.manual_seed(SEED + rank)
-    print(f"Using seed {SEED + rank}")
+    # torch.manual_seed(SEED + rank)
+    # print(f"Using seed {SEED + rank}")
 
-    try_barrier(device=utils.device.DEVICE)
+    # try_barrier(device=utils.device.DEVICE)
 
-    try:
-        # run main function
-        main()
-    finally:
-        # always destroy workers when finished
-        destroy_workers()
+    # try:
+    #     # run main function
+    main()
+    # finally:
+    #     # always destroy workers when finished
+    #     destroy_workers()

@@ -1,4 +1,5 @@
 from typing import Any, Optional, cast
+from diffusers.utils.torch_utils import randn_tensor
 
 import numpy as np
 import torch
@@ -11,17 +12,20 @@ from denoisers.base import Denoiser
 from models.base import PretrainedModel
 from utils.log import progress_columns
 from verifiers.base import Verifier
+from typing import Dict
 
 from .base import Searcher
+from diffusers import DiffusionPipeline
 
 
 class RandomSearch(Searcher):
     def __init__(
         self,
-        denoiser: Denoiser,
+        pipeline: DiffusionPipeline,
         verifier: Verifier,
         denoising_steps: int,
         num_samples: int,
+        num_images_per_prompt: int,
         max_batch_size: int,
         *,
         distributed=False,
@@ -45,7 +49,7 @@ class RandomSearch(Searcher):
             Whether the search should be distributed.
         """
 
-        super().__init__(denoiser, verifier, denoising_steps, distributed=distributed)
+        super().__init__(pipeline, verifier, distributed=distributed)
 
         if distributed:
             assert num_samples % dist.get_world_size() == 0
@@ -53,15 +57,19 @@ class RandomSearch(Searcher):
         else:
             self.num_samples = num_samples
         self.max_batch_size = max_batch_size
+        self.num_images_per_prompt = num_images_per_prompt
+        self.height = 768
+        self.width = 768
 
     @torch.no_grad
     def search(
         self,
-        noise_shape: tuple[int, ...],
+        # noise_shape: tuple[int, ...],
         prompt: str,
         *,
         init_noise_sigma: float = 1,
-        denoiser_kwargs: Optional[dict[str, Any]] = None,
+        num_prompts: int = 1,
+        pipeline_kwargs: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
         Generates N random samples of noise, and picks the best K according to the verifier.
@@ -71,17 +79,21 @@ class RandomSearch(Searcher):
         Given the desired noise shape, `noise_shape[0]` gives the desired batch size (K),
         so we pick the top K initial noises to return.
         """
-        if denoiser_kwargs is None:
-            denoiser_kwargs = {}
+        if pipeline_kwargs is None:
+            pipeline_kwargs = {}
 
-        batch_size = noise_shape[0]
-        new_noise_shape = (self.num_samples, *noise_shape)
-        candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
+        print(pipeline_kwargs)
+        #batch_size = noise_shape[0]
+        #new_noise_shape = (self.num_samples, *noise_shape)
 
         # max_batch_size should be a multiple of batch_size
-        assert self.max_batch_size % batch_size == 0
+        #assert self.max_batch_size % batch_size == 0
 
-        final_batch_size = min(self.num_samples * batch_size, self.max_batch_size)
+        final_batch_size = self.num_samples * self.num_images_per_prompt
+        new_noise_shape=self.initial_latent_size(
+            num_prompts, final_batch_size, self.height, self.width
+        )
+        candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
 
         # total noises should either be less than the max, or it should evenly divide into splits of the max size
         assert (
@@ -90,14 +102,34 @@ class RandomSearch(Searcher):
         ), f"Final batch size ({final_batch_size}) must be smaller or evenly divide the max batch size ({self.max_batch_size})"
 
         # modify the number of images per prompt
-        scale = final_batch_size // batch_size
-        num_images_per_prompt = denoiser_kwargs.get("num_images_per_prompt", 1) * scale
-        denoiser_kwargs["num_images_per_prompt"] = num_images_per_prompt
+        # scale = final_batch_size // batch_size
+        # num_images_per_prompt = pipeline_kwargs.get("num_images_per_prompt", 1) * scale
+        # pipeline_kwargs["num_images_per_prompt"] = num_images_per_prompt
 
         # for each candidate noise, pass it through the model to evaluate
         scores = []
+        
+        # # Extract a batch of noise items
+        # noises = get_noises(
+        #     max_seed=MAX_SEED,
+        #     num_samples=num_noises_to_sample,
+        #     dtype=torch_dtype,
+        #     fn=get_latent_prep_fn(pipeline_name),
+        #     **pipeline_call_args,
+        # )
+        # noises: dict[int, torch.Tensor] # seed -> noise
+        # noise_items = list(noises.items())
+
+        # for i in range(0, len(noise_items), batch_size_for_img_gen):
+
+        #     batch = noise_items[i : i + batch_size_for_img_gen]
+        #     seeds_batch, noises_batch = zip(*batch) # Separate seeds and noises
+        #     batched_latents = torch.stack(noises_batch).squeeze(dim=1) #  [channels, height, width]
+
+
+
         for noise_batch in tqdm(
-            candidate_noises.flatten(0, 1).split(self.max_batch_size),
+            candidate_noises.split(self.max_batch_size), # Splits the first dimension
             desc="Searching over noises",
         ):
             print(noise_batch.shape)
@@ -105,26 +137,32 @@ class RandomSearch(Searcher):
             # print("Memory before denoise:")
             # print(torch.cuda.memory_summary(utils.device.DEVICE))
 
-            denoised = self.denoiser.denoise(noise_batch, prompt, **denoiser_kwargs)
-            for noise, image in zip(noise_batch, denoised):
+            # denoised = self.denoiser.denoise(noise_batch, prompt, **pipeline_kwargs)
+            batched_prompts = [prompt] * len(candidate_noises)
+            batch_result = self.pipeline(prompt=batched_prompts, latents=candidate_noises, height = self.height, width = self.width)
+            print(type(batch_result))
+            
+            for noise, image in zip(noise_batch, batch_result.images):
                 score = self.verifier.get_reward(prompt, image)
                 # store using numpy to avoid using more GPU memory
                 scores.append((score, utils.device.to_numpy(noise)))
                 print(score)
-            del denoised
+            del batch_result
             torch.cuda.empty_cache()
 
             # print("Memory after denoise:")
             # print(torch.cuda.memory_summary(utils.device.DEVICE))
 
         sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
-        best_scores = sorted_scores[:batch_size]
+        best_scores = sorted_scores[:self.num_images_per_prompt]
 
         print("Best scores:")
         print([t[0] for t in best_scores])
-        best_noises = [t[1] for t in best_scores]
+        
+        best_noises = [torch.tensor(t[1]) for t in best_scores]
 
         if not self.distributed:
+            # best_noises 
             return torch.stack(best_noises, dim=0)
 
         # if distributed, then we need to gather and get the k largest again
@@ -142,7 +180,7 @@ class RandomSearch(Searcher):
         if dist.get_rank() == 0:
             gathered_noises = [
                 torch.zeros(
-                    (len(best_scores), *noise_shape[1:]), device=utils.device.DEVICE
+                    (len(best_scores), *new_noise_shape[1:]), device=utils.device.DEVICE
                 )
                 for _ in range(n_ranks)
             ]
@@ -174,8 +212,8 @@ class RandomSearch(Searcher):
 
             sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
             print("Best scores:")
-            print([t[0] for t in sorted_scores[:batch_size]])
-            best_noises = [t[1] for t in sorted_scores[:batch_size]]
+            print([t[0] for t in sorted_scores[:self.num_images_per_prompt]])
+            best_noises = [t[1] for t in sorted_scores[:self.num_images_per_prompt]]
 
             return torch.stack(best_noises, dim=0)
 
@@ -184,3 +222,27 @@ class RandomSearch(Searcher):
 
         # return none of not the first rank
         return None
+    
+
+    def initial_latent_size(
+        self, num_prompts: int, num_images_per_prompt: int, height: int, width: int
+    ) -> tuple[int, ...]:
+        """
+        Compute the initial shape of the latents, of the form
+            (batch_size, channels, height, width)
+        where:
+            - `batch_size` is num_prompts * num_images_per_prompt
+            - `channels` is taken from the unet input channel count
+            - `height` and `width` are scaled down by the VAE scale factor from the pipeline
+        """
+        num_channels_latents: int = self.pipeline.unet.config.in_channels
+        vae_scale_factor: int = self.pipeline.vae_scale_factor
+
+        shape = (
+            num_prompts * num_images_per_prompt,
+            num_channels_latents,
+            int(height) // vae_scale_factor,
+            int(width) // vae_scale_factor,
+        )
+
+        return shape

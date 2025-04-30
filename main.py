@@ -20,11 +20,16 @@ def main(
     num_search_samples=16,
     only_load_models=False,
 ):
-    cur_rank = dist.get_rank()
-    n_ranks = dist.get_world_size()
+    if only_load_models:
+        # dummy values if we only want to load models
+        cur_rank = 0
+        n_ranks = 1
+    else:
+        cur_rank = dist.get_rank()
+        n_ranks = dist.get_world_size()
 
-    # search samples should be evenly distributed across ranks
-    assert num_search_samples % n_ranks == 0
+        # search samples should be evenly distributed across ranks
+        assert num_search_samples % n_ranks == 0
 
     num_prompts = 1
     num_images_per_prompt = 1
@@ -49,7 +54,7 @@ def main(
         "num_images_per_prompt": num_images_per_prompt,
     }
 
-    model = StableDiffusionModel(distributed=True)
+    model = StableDiffusionModel(distributed=not only_load_models)
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
@@ -69,14 +74,14 @@ def main(
 
     torch.cuda.empty_cache()
 
+    if only_load_models:
+        # end function here if we only want to load models
+        return
+
     try_barrier(device=utils.device.DEVICE)
     # print("Initial memory")
     # print(torch.cuda.memory_summary(utils.device.DEVICE))
     # print(torch.cuda.memory_summary(0))
-
-    if only_load_models:
-        # end function here if we only want to load models
-        return
 
     EVENT_search_start = torch.cuda.Event(enable_timing=True)
     EVENT_search_end = torch.cuda.Event(enable_timing=True)
@@ -97,7 +102,6 @@ def main(
             denoiser_kwargs=search_denoiser_kwargs,
         )
         EVENT_search_end.record()
-
 
         # broadcast the best initial noise across all GPUs
         # dist.broadcast(initial_noise, src=0)
@@ -124,9 +128,13 @@ def main(
 
     # must synchronize before computing timings
     torch.cuda.synchronize()
-    print(f"[rank {cur_rank}] Search time {EVENT_search_start.elapsed_time(EVENT_search_end)}ms")
+    print(
+        f"[rank {cur_rank}] Search time {EVENT_search_start.elapsed_time(EVENT_search_end)}ms"
+    )
     if dist.get_rank() == 0:
-        print(f"[rank {cur_rank}] Denoise time {EVENT_denoise_start.elapsed_time(EVENT_denoise_end)}ms")
+        print(
+            f"[rank {cur_rank}] Denoise time {EVENT_denoise_start.elapsed_time(EVENT_denoise_end)}ms"
+        )
 
 
 if __name__ == "__main__":
@@ -149,7 +157,12 @@ if __name__ == "__main__":
         default=20,
         help="Number of inference steps for search denoising",
     )
-    parser.add_argument("--num-search-samples", type=int, default=16, help="Total number of search samples (evenly distributed among processes)")
+    parser.add_argument(
+        "--num-search-samples",
+        type=int,
+        default=16,
+        help="Total number of search samples (evenly distributed among processes)",
+    )
 
     parser.add_argument(
         "--only-load-models",
@@ -159,20 +172,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # initialize distributed workers
-    rank, n_ranks = init_workers()
-    print(f"Initialized rank {rank} out of {n_ranks}")
-
-    # initialize the current device
-    utils.device.init(distributed=True)
-
-    torch.manual_seed(SEED + rank)
-    print(f"Using seed {SEED + rank}")
-
-    try_barrier(device=utils.device.DEVICE)
-
-    try:
-        # run main function
+    if args.only_load_models:
+        # run main function and exit,
+        # without setting up any distributed workers
+        utils.device.init(distributed=False)
         main(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
@@ -180,6 +183,28 @@ if __name__ == "__main__":
             num_search_samples=args.num_search_samples,
             only_load_models=args.only_load_models,
         )
-    finally:
-        # always destroy workers when finished
-        destroy_workers()
+    else:
+        # initialize distributed workers
+        rank, n_ranks = init_workers()
+        print(f"Initialized rank {rank} out of {n_ranks}")
+
+        # initialize the current device
+        utils.device.init(distributed=True)
+
+        torch.manual_seed(SEED + rank)
+        print(f"Using seed {SEED + rank}")
+
+        try_barrier(device=utils.device.DEVICE)
+
+        try:
+            # run main function
+            main(
+                prompt=args.prompt,
+                num_inference_steps=args.num_inference_steps,
+                num_search_inference_steps=args.num_search_inference_steps,
+                num_search_samples=args.num_search_samples,
+                only_load_models=args.only_load_models,
+            )
+        finally:
+            # always destroy workers when finished
+            destroy_workers()

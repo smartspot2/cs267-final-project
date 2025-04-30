@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 
 import utils.device
-from denoisers import DDPMDenoiser, ParadigmsDenoiser
+from denoisers import DDPMDenoiser, ParadigmsDenoiser, DiffusionPipelineDenoiser
 from models.stable_diffusion import StableDiffusionModel
 from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
@@ -14,7 +14,7 @@ SEED = 0x280
 
 def main():
     num_prompts = 1
-    num_images_per_prompt = 2
+    num_images_per_prompt = 2 # TOP2 per task
     prompt = "A cat on the surface of the moon"
     height = 768
     width = 768
@@ -23,7 +23,7 @@ def main():
 
     # search params`
     num_search_inference_steps = 50
-    num_search_samples = 8
+    num_search_samples = 8 # N per task (or total across all tasks)
 
     # inference params
     num_inference_steps = 50
@@ -41,12 +41,12 @@ def main():
         "num_inference_steps": num_search_inference_steps,
     }
 
-    model = StableDiffusionModel(distributed=True)
+    model = StableDiffusionModel(distributed=False)
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
-    # denoiser = DDPMDenoiser(model)
-    denoiser = ParadigmsDenoiser(model)
+    denoiser = DiffusionPipelineDenoiser(model)
+    # denoiser = ParadigmsDenoiser(model)
     print("Loaded denoiser")
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)
     searcher = RandomSearch(
@@ -55,7 +55,7 @@ def main():
         denoising_steps=num_search_inference_steps,
         num_samples=num_search_samples,
         max_batch_size=32,
-        distributed=True,
+        distributed=False,
     )
     print("Loaded searcher")
 
@@ -102,21 +102,21 @@ def main():
 
 if __name__ == "__main__":
 
-    # initialize distributed workers
-    rank, n_ranks = init_workers()
-    print(f"Initialized rank {rank} out of {n_ranks}")
+    # # initialize distributed workers
+    # rank, n_ranks = init_workers()
+    # print(f"Initialized rank {rank} out of {n_ranks}")
 
-    # initialize the current device
-    utils.device.init(distributed=True)
+    # # initialize the current device
+    # utils.device.init(distributed=True)
 
-    torch.manual_seed(SEED + rank)
-    print(f"Using seed {SEED + rank}")
+    # torch.manual_seed(SEED + rank)
+    # print(f"Using seed {SEED + rank}")
 
-    try_barrier(device=utils.device.DEVICE)
+    # try_barrier(device=utils.device.DEVICE)
 
-    try:
+    # try:
         # run main function
-        main()
-    finally:
-        # always destroy workers when finished
-        destroy_workers()
+    main()
+    # finally:
+    #     # always destroy workers when finished
+    #     destroy_workers()

@@ -1,2 +1,3 @@
 from .ddpm_denoiser import DDPMDenoiser
 from .paradigms_denoiser import ParadigmsDenoiser
+from .hfdiffusion_pipeline_denoiser import DiffusionPipelineDenoiser

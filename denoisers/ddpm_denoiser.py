@@ -19,8 +19,7 @@ class DDPMDenoiser(Denoiser):
     ):
         super().__init__(model)
 
-        self.scheduler = DDPMScheduler().from_pretrained(
-            model.model_id, subfolder="scheduler", cache_dir=utils.cache.CACHE_DIR
+        self.scheduler = DDPMScheduler().from_pretrained(model.model_id, subfolder="scheduler", cache_dir=utils.cache.CACHE_DIR
         )
 
     def denoise(

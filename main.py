@@ -1,16 +1,72 @@
 import matplotlib.pyplot as plt
 import torch
 import torch.distributed as dist
+import os
 
 import utils.device
+import utils.cache
 from denoisers import DDPMDenoiser, ParadigmsDenoiser, DiffusionPipelineDenoiser
 from models.stable_diffusion import StableDiffusionModel
 from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
 from verifiers.image_reward import ImageRewardVerifier
+from diffusers import DiffusionPipeline
 
 SEED = 0x280
 
+# Define torch dtype map similar to the original code
+TORCH_DTYPE_MAP = {
+    "fp16": torch.float16,
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "auto": torch.float16 if torch.cuda.is_available() else torch.float32
+}
+
+def prepare_fp_kwargs(config=None):
+    """
+    Prepare kwargs for the diffusion pipeline based on configuration.
+    This function mimics the pipeline setup from the original code.
+    
+    Args:
+        config: Dictionary containing configuration parameters (optional)
+    
+    Returns:
+        Dictionary with kwargs for pipeline initialization
+    """
+    if config is None:
+        # Default configuration if none provided
+        config = {
+            "pretrained_model_name_or_path": "runwayml/stable-diffusion-v1-5",
+            "torch_dtype": "auto"
+        }
+    
+    # Extract the model name from config (copy to avoid modifying original)
+    config_copy = config.copy()
+    pipeline_name = config_copy.pop("pretrained_model_name_or_path", "runwayml/stable-diffusion-v1-5")
+    
+    # Get torch dtype from config
+    torch_dtype_str = config_copy.pop("torch_dtype", "auto")
+    torch_dtype = TORCH_DTYPE_MAP[torch_dtype_str]
+    
+    # Create the basic kwargs dictionary
+    fp_kwargs = {"pretrained_model_name_or_path": pipeline_name, "torch_dtype": torch_dtype}
+    
+    # Add cache_dir to kwargs
+    fp_kwargs["cache_dir"] = utils.cache.CACHE_DIR
+    
+    # Special handling for Wanwang models
+    if "Wan" in pipeline_name:
+        # As per recommendations from huggingface docs
+        from diffusers import AutoencoderKLWan
+        vae = AutoencoderKLWan.from_pretrained(
+            pipeline_name, 
+            subfolder="vae", 
+            torch_dtype=torch.float32, 
+            cache_dir= utils.cache.CACHE_DIR
+        )
+        fp_kwargs.update({"vae": vae})
+    
+    return fp_kwargs
 
 def main():
     num_prompts = 1
@@ -45,7 +101,7 @@ def main():
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
-    denoiser = DiffusionPipelineDenoiser(model)
+    denoiser = DiffusionPipelineDenoiser(DiffusionPipeline.from_pretrained(**fp_kwargs, cache_dir="cache").to(("cuda:0" if torch.cuda.is_available() else "cpu")))
     # denoiser = ParadigmsDenoiser(model)
     print("Loaded denoiser")
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)

@@ -1,6 +1,8 @@
+import time
 from typing import Any, Callable, Optional
 
 import torch
+import torch.distributed as dist
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler, DDIMSchedulerOutput
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler, DDPMSchedulerOutput
 from diffusers.utils.pil_utils import pt_to_pil
@@ -116,6 +118,9 @@ class ParadigmsDenoiser(Denoiser):
         """
 
         print("parallel pipeline!", flush=True)
+        cur_rank = dist.get_rank()
+        n_ranks = dist.get_world_size()
+        assert cur_rank == 0, "Main paradigms manager node must be run on rank 0"
 
         # 0. Default height and width to unet
         # height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -187,8 +192,8 @@ class ParadigmsDenoiser(Denoiser):
         stats_flop_count = 0
         parallel = min(parallel, len(scheduler.timesteps))
 
-        begin_idx = 0
-        end_idx = parallel
+        begin_idx: int = 0
+        end_idx: int = parallel
         latents_time_evolution_buffer = torch.stack(
             [latents] * (len(scheduler.timesteps) + 1)
         )
@@ -261,13 +266,98 @@ class ParadigmsDenoiser(Denoiser):
             #     cross_attention_kwargs=cross_attention_kwargs,
             #     return_dict=False,
             # )[0]
-            model_output = self.model.forward(
-                latent_model_input.flatten(0, 1),
-                t_vec.flatten(0, 1),
-                encoder_hidden_states=block_prompt_embeds.flatten(0, 1),
-                cross_attention_kwargs=cross_attention_kwargs,
-                # return_dict=False,
-            )[0]
+
+            # NOTE: old code for parallel = 1
+            # expected_model_output = self.model.forward(
+            #     latent_model_input.flatten(0, 1),
+            #     t_vec.flatten(0, 1),
+            #     encoder_hidden_states=block_prompt_embeds.flatten(0, 1),
+            #     cross_attention_kwargs=cross_attention_kwargs,
+            #     # return_dict=False,
+            # )[0]
+
+            # split into n-1 chunks; skip self
+            chunks = torch.arange(parallel_len).tensor_split(n_ranks - 1)
+            latent_model_input_chunks = [latent_model_input[chunk] for chunk in chunks]
+            t_vec_chunks = [t_vec[chunk] for chunk in chunks]
+            block_prompt_embeds_chunks = [
+                block_prompt_embeds[chunk] for chunk in chunks
+            ]
+            num_chunks = min(parallel_len, n_ranks - 1)
+
+            send_requests = []
+            model_outputs = [None for _ in range(num_chunks)]
+            for idx in range(num_chunks):  # skip rank 0 (self)
+                rank = idx + 1
+                # send shapes first
+                send_requests.append(
+                    dist.isend(
+                        torch.tensor(
+                            list(latent_model_input_chunks[idx].shape),
+                            dtype=torch.int,
+                            device=device,
+                        ),
+                        rank,
+                    )
+                )
+                send_requests.append(
+                    dist.isend(
+                        torch.tensor(
+                            list(t_vec_chunks[idx].shape),
+                            dtype=torch.int,
+                            device=device,
+                        ),
+                        rank,
+                    )
+                )
+                send_requests.append(
+                    dist.isend(
+                        torch.tensor(
+                            list(block_prompt_embeds_chunks[idx].shape),
+                            dtype=torch.int,
+                            device=device,
+                        ),
+                        rank,
+                    )
+                )
+
+                # then send actual tensors
+                send_requests.append(dist.isend(latent_model_input_chunks[idx], rank))
+                send_requests.append(dist.isend(t_vec_chunks[idx], rank))
+                send_requests.append(dist.isend(block_prompt_embeds_chunks[idx], rank))
+
+                # prepare model output list for next gather
+                # input_shape = latent_model_input_chunks[idx].shape
+                # output_shape = (input_shape[0] * input_shape[1], *input_shape[2:])
+                model_outputs[idx] = torch.zeros_like(
+                    latent_model_input_chunks[idx].flatten(0, 1), device=device
+                )
+                # NOTE: cross_attention_kwargs not communicated
+
+            # wait on tensor send requests
+            print("Waiting on send requests...")
+            for req in send_requests:
+                req.wait()
+
+            recv_requests = []
+            for idx in range(num_chunks):
+                rank = idx + 1
+                recv_requests.append(dist.irecv(model_outputs[idx], rank))
+
+            # wait on all receives to finish
+            print("Waiting on recv requests...")
+            for req in recv_requests:
+                req.wait()
+
+            # concatenate all model outputs
+            model_output = torch.cat(model_outputs, dim=0)
+
+            # synchronize? TODO: not sure if necessary
+            # torch.cuda.synchronize()
+
+            # print(torch.allclose(expected_model_output, model_output))
+            # print(torch.norm(expected_model_output - model_output))
+            # model_output = expected_model_output
 
             per_latent_shape = model_output.shape[1:]
             if do_classifier_free_guidance:
@@ -358,6 +448,16 @@ class ParadigmsDenoiser(Denoiser):
 
         end.record()
 
+        # stop all workers (send all zeroes as the first shape)
+        print("Stopping workers...")
+        send_requests = []
+        for rank in range(1, n_ranks):
+            send_requests.append(
+                dist.isend(torch.zeros(5, dtype=torch.int, device=device), rank)
+            )
+        for req in send_requests:
+            req.wait()
+
         # Waits for everything to finish running
         torch.cuda.synchronize()
 
@@ -442,6 +542,81 @@ class ParadigmsDenoiser(Denoiser):
         print(stats)
         print(image)
         return image
+
+    def worker(
+        self,
+        cross_attention_kwargs: Optional[dict[str, Any]] = None,
+    ):
+        """
+        Worker thread for paradigms.
+
+        Important things to keep in mind:
+        - number of dimensions must match exactly with expected
+        - tensor dtypes must match exactly with expected
+        """
+        device = utils.device.DEVICE
+
+        while True:
+            # receive shapes first
+
+            # (parallel, batch, channels, height, width)
+            latent_model_input_shape = torch.zeros(5, dtype=torch.int, device=device)
+            # (parallel, batch)
+            t_vec_shape = torch.zeros(2, dtype=torch.int, device=device)
+            # (parallel, batch, channels, features)
+            block_prompt_embeds_shape = torch.zeros(4, dtype=torch.int, device=device)
+
+            print("Worker receiving shapes...")
+            dist.recv(latent_model_input_shape, 0)
+            if (latent_model_input_shape == 0).all():
+                # stop if we receive all zeroes
+                print("Exiting...")
+                return
+
+            dist.recv(t_vec_shape, 0)
+            dist.recv(block_prompt_embeds_shape, 0)
+
+            # use shapes to initialize tensors
+            latent_model_input_shape = latent_model_input_shape.tolist()
+            t_vec_shape = t_vec_shape.tolist()
+            block_prompt_embeds_shape = block_prompt_embeds_shape.tolist()
+            latent_model_input = torch.zeros(
+                latent_model_input_shape, dtype=torch.float32, device=device
+            )
+            t_vec = torch.zeros(t_vec_shape, dtype=torch.int64, device=device)
+            block_prompt_embeds = torch.zeros(
+                block_prompt_embeds_shape, dtype=torch.float32, device=device
+            )
+
+            # then receive actual tensors
+            print("Worker receiving tensors...")
+            dist.recv(latent_model_input, 0)
+            dist.recv(t_vec, 0)
+            dist.recv(block_prompt_embeds, 0)
+
+            print("Running model...")
+
+            # run the model on the given inputs
+            model_output = self.model.forward(
+                latent_model_input.flatten(0, 1),
+                t_vec.flatten(0, 1),
+                encoder_hidden_states=block_prompt_embeds.flatten(0, 1),
+                cross_attention_kwargs=cross_attention_kwargs,
+                # return_dict=False,
+            )[0]
+
+            # model_output_2 = self.model.forward(
+            #     latent_model_input.flatten(0, 1),
+            #     t_vec.flatten(0, 1),
+            #     encoder_hidden_states=block_prompt_embeds.flatten(0, 1),
+            #     cross_attention_kwargs=cross_attention_kwargs,
+            #     # return_dict=False,
+            # )[0]
+            #
+            # print("two model evals close?", torch.allclose(model_output, model_output_2))
+
+            # finally, send the model output back to the manager node
+            dist.send(model_output, 0)
 
 
 class ParaDDPMScheduler(DDPMScheduler):

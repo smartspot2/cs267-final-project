@@ -24,15 +24,7 @@ class StableDiffusionModel(PretrainedModel):
             self.model_id, cache_dir=utils.cache.CACHE_DIR
         ).to(utils.device.DEVICE)
 
-        if self.distributed:
-            # replace models with a distributed version via pytorch
-            # TODO: handle chunking?
-            device_ids = [utils.device.DEVICE.index]
-            self.unet = DistributedDataParallel(
-                self.pipeline.unet, device_ids=device_ids
-            )
-        else:
-            self.unet = self.pipeline.unet
+        self.unet = self.pipeline.unet
 
         self.pipeline.unet.eval()
         self.pipeline.vae.eval()

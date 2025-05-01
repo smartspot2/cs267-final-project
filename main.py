@@ -14,10 +14,14 @@ SEED = 0x280
 
 def main(
     prompt="a beautiful castle, matte painting",
-    num_inference_steps=50,
+    num_inference_steps=100,
     num_search_inference_steps=20,
     # total number of search samples among all processes
     num_search_samples=16,
+    use_paradigms=True,
+    # parallelism for paradigms denoiser
+    paradigms_parallel=16,
+    paradigms_tolerance=0.05,
     only_load_models=False,
 ):
     if only_load_models:
@@ -36,14 +40,11 @@ def main(
     height = 768
     width = 768
 
-    parallel = 1  # paralleism for paradigms denoiser
-
     # kwargs dicts
     common_denoiser_kwargs = {
         "height": height,
         "width": width,
         "num_inference_steps": num_inference_steps,
-        # "parallel": parallel,
     }
     search_denoiser_kwargs = {
         **common_denoiser_kwargs,
@@ -53,17 +54,23 @@ def main(
         **common_denoiser_kwargs,
         "num_images_per_prompt": num_images_per_prompt,
     }
+    if use_paradigms:
+        final_denoiser_kwargs["parallel"] = paradigms_parallel
+        final_denoiser_kwargs["tolerance"] = paradigms_tolerance
 
     model = StableDiffusionModel(distributed=not only_load_models)
     print("Loaded model")
     verifier = ImageRewardVerifier()
     print("Loaded verifier")
-    denoiser = DDIMDenoiser(model)
-    # denoiser = ParadigmsDenoiser(model)
-    print("Loaded denoiser")
+    search_denoiser = DDIMDenoiser(model)
+    if use_paradigms:
+        final_denoiser = ParadigmsDenoiser(model)
+    else:
+        final_denoiser = search_denoiser
+    print("Loaded denoisers")
     # searcher = NoSearch(denoiser, verifier, denoising_steps=num_search_inference_steps)
     searcher = RandomSearch(
-        denoiser,
+        search_denoiser,
         verifier,
         denoising_steps=num_search_inference_steps,
         num_samples=num_search_samples // n_ranks,
@@ -83,6 +90,10 @@ def main(
     # print(torch.cuda.memory_summary(utils.device.DEVICE))
     # print(torch.cuda.memory_summary(0))
 
+    # initialize all communicators at the very beginning
+    # NOTE: can be used to eliminate communication setup as a potential issue when debugging
+    # comm_warmup()
+
     EVENT_search_start = torch.cuda.Event(enable_timing=True)
     EVENT_search_end = torch.cuda.Event(enable_timing=True)
 
@@ -98,7 +109,7 @@ def main(
                 num_prompts, num_images_per_prompt, height, width
             ),
             prompt=prompt,
-            init_noise_sigma=denoiser.scheduler.init_noise_sigma,
+            init_noise_sigma=search_denoiser.scheduler.init_noise_sigma,
             denoiser_kwargs=search_denoiser_kwargs,
         )
         EVENT_search_end.record()
@@ -113,7 +124,9 @@ def main(
             print("Performing final denoise...")
             # generate the output given the initial noise
             EVENT_denoise_start.record()
-            denoised = denoiser.denoise(initial_noise, prompt, **final_denoiser_kwargs)
+            denoised = final_denoiser.denoise(
+                initial_noise, prompt, **final_denoiser_kwargs
+            )
             EVENT_denoise_end.record()
 
             print(denoised)
@@ -123,6 +136,10 @@ def main(
                 print(f"Image {idx} score:", reward)
                 plt.imshow(image)
                 plt.show()
+        else:
+            if isinstance(final_denoiser, ParadigmsDenoiser):
+                print("Launching worker thread...")
+                final_denoiser.worker()
 
     try_barrier(device=utils.device.DEVICE)
 
@@ -137,6 +154,39 @@ def main(
         )
 
 
+def comm_warmup():
+    """
+    NCCL initializes communicators lazily; this function sends a test message between all pairs of ranks,
+    to initialize the communicators all at the beginning of the program execution.
+    """
+    cur_rank = dist.get_rank()
+    n_ranks = dist.get_world_size()
+    device = utils.device.DEVICE
+
+    for source_rank in range(n_ranks):
+        print(f"Warmup with source rank {source_rank} ({source_rank+1}/{n_ranks})...")
+        if cur_rank == source_rank:
+            # send to all other ranks
+            send_requests = []
+            for rank in range(n_ranks):
+                if rank != cur_rank:
+                    send_requests.append(
+                        dist.isend(torch.tensor(0, device=device), rank)
+                    )
+
+            # wait on sends
+            for req in send_requests:
+                req.wait()
+        else:
+            # receive from source rank
+            result = torch.tensor(1, device=device)
+            dist.recv(result, source_rank)
+
+        dist.barrier()
+
+    dist.barrier()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -148,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-inference-steps",
         type=int,
-        default=50,
+        default=100,
         help="Number of inference steps for final denoising",
     )
     parser.add_argument(
@@ -162,6 +212,24 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="Total number of search samples (evenly distributed among processes)",
+    )
+
+    parser.add_argument(
+        "--use-paradigms",
+        action="store_true",
+        help="Whether to use paradigms as the final denoiser",
+    )
+    parser.add_argument(
+        "--paradigms-parallel",
+        type=int,
+        default=16,
+        help="Parallelism for paradigms denoiser",
+    )
+    parser.add_argument(
+        "--paradigms-tolerance",
+        type=float,
+        default=0.05,
+        help="Tolerance for paradigms execution",
     )
 
     parser.add_argument(
@@ -181,6 +249,8 @@ if __name__ == "__main__":
             num_inference_steps=args.num_inference_steps,
             num_search_inference_steps=args.num_search_inference_steps,
             num_search_samples=args.num_search_samples,
+            use_paradigms=args.use_paradigms,
+            paradigms_parallel=args.paradigms_parallel,
             only_load_models=args.only_load_models,
         )
     else:
@@ -203,6 +273,9 @@ if __name__ == "__main__":
                 num_inference_steps=args.num_inference_steps,
                 num_search_inference_steps=args.num_search_inference_steps,
                 num_search_samples=args.num_search_samples,
+                use_paradigms=args.use_paradigms,
+                paradigms_parallel=args.paradigms_parallel,
+                paradigms_tolerance=args.paradigms_tolerance,
                 only_load_models=args.only_load_models,
             )
         finally:

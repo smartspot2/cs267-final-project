@@ -75,15 +75,15 @@ def main(
         denoising_steps=num_search_inference_steps,
         num_samples=num_search_samples // n_ranks,
         max_batch_size=32,
-        distributed=True,
+        distributed=not only_load_models,
     )
     print("Loaded searcher")
 
     torch.cuda.empty_cache()
 
-    # if only_load_models:
-    #     # end function here if we only want to load models
-    #     return
+    if only_load_models:
+        # end function here if we only want to load models
+        return
 
     try_barrier(device=utils.device.DEVICE)
     # print("Initial memory")
@@ -204,13 +204,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-search-inference-steps",
         type=int,
-        default=20,
+        default=10,
         help="Number of inference steps for search denoising",
     )
     parser.add_argument(
         "--num-search-samples",
         type=int,
-        default=16,
+        default=2,
         help="Total number of search samples (evenly distributed among processes)",
     )
 

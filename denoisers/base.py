@@ -19,6 +19,7 @@ class Denoiser(abc.ABC):
         width: int,
         num_images_per_prompt: int = 1,
         num_inference_steps: int = 50,
+        save_intermediate_path: str = None,
         **kwargs,
     ):
         """

@@ -81,9 +81,9 @@ def main(
 
     torch.cuda.empty_cache()
 
-    if only_load_models:
-        # end function here if we only want to load models
-        return
+    # if only_load_models:
+    #     # end function here if we only want to load models
+    #     return
 
     try_barrier(device=utils.device.DEVICE)
     # print("Initial memory")
@@ -125,7 +125,7 @@ def main(
             # generate the output given the initial noise
             EVENT_denoise_start.record()
             denoised = final_denoiser.denoise(
-                initial_noise, prompt, **final_denoiser_kwargs
+                initial_noise, prompt, save_intermediate_path="./output", **final_denoiser_kwargs
             )
             EVENT_denoise_end.record()
 

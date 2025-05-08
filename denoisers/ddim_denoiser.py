@@ -50,6 +50,7 @@ class DDIMDenoiser(Denoiser):
         #     Union[Callable[[int, int, dict], None], PipelineCallback, MultiPipelineCallbacks]
         # ] = None,
         # callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        save_intermediate_path: Optional[str] = None,
         # **kwargs,
     ):
         """
@@ -71,6 +72,8 @@ class DDIMDenoiser(Denoiser):
             ip_adapter_image_embeds=None,
             callback_on_step_end_tensor_inputs=None,
         )
+        self.save_intermediate_images = True if save_intermediate_path is not None else False
+        self.save_intermediate_path = save_intermediate_path    
 
         # self._guidance_scale = guidance_scale
         # self._guidance_rescale = guidance_rescale
@@ -173,6 +176,9 @@ class DDIMDenoiser(Denoiser):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         # self._num_timesteps = len(timesteps)
+        if self.save_intermediate_images:
+            images = []
+        
         with Progress(*progress_columns()) as progress_bar:
             task_id = progress_bar.add_task(
                 description="Performing inference", total=num_inference_steps
@@ -218,13 +224,21 @@ class DDIMDenoiser(Denoiser):
 
                 # TODO: this adds noise, which we don't have control over
                 # compute the previous noisy sample x_t -> x_t-1
-                latents: torch.Tensor = self.scheduler.step(
+                latents, final_x0 = self.scheduler.step(
                     noise_pred,
                     t,
                     latents,
                     # **extra_step_kwargs,
                     return_dict=False,
-                )[0]
+                )
+
+                if self.save_intermediate_images:
+                    image = self.model.decode_image(final_x0)[0]
+                    image = self.model.postprocess_image(image)
+                    images.append((t, image))
+                    # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")   
+                    # # save the image
+                    # image[0].save(save_path)
 
                 # if callback_on_step_end is not None:
                 #     callback_kwargs = {}
@@ -249,6 +263,15 @@ class DDIMDenoiser(Denoiser):
 
                 # if XLA_AVAILABLE:
                 #     xm.mark_step()
+
+        if self.save_intermediate_images:
+            import os
+            # create the output folder if it doesn't exist
+            os.makedirs(self.save_intermediate_path, exist_ok=True)
+            for i, (t, image) in enumerate(images):
+                save_path = os.path.join(self.save_intermediate_path, f"image_t_{t}.png")   
+                # save the image
+                image[0].save(save_path)
 
         image = self.model.decode_image(
             latents,  # scaling factor is taken into account within the model

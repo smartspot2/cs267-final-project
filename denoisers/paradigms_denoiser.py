@@ -46,6 +46,7 @@ class ParadigmsDenoiser(Denoiser):
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
         full_return: bool = False,
+        intermediate_image_path: Optional[str] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -116,6 +117,9 @@ class ParadigmsDenoiser(Denoiser):
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
+
+        # TODO: no intermediate image saving for now (paradigms not used in search)
+        del intermediate_image_path
 
         print("parallel pipeline!", flush=True)
         cur_rank = dist.get_rank()

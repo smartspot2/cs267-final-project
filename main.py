@@ -1,4 +1,7 @@
-import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+from typing import Any
+
 import torch
 import torch.distributed as dist
 
@@ -9,7 +12,7 @@ from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
 from verifiers.image_reward import ImageRewardVerifier
 
-SEED = 0x280
+DEFAULT_SEED = 0x280
 
 
 def main(
@@ -18,11 +21,15 @@ def main(
     num_search_inference_steps=20,
     # total number of search samples among all processes
     num_search_samples=16,
+    load_balance_search=True,
+    load_balance_batch_size=4,
     use_paradigms=True,
     # parallelism for paradigms denoiser
     paradigms_parallel=16,
     paradigms_tolerance=0.05,
     only_load_models=False,
+    save_intermediate_images=False,
+    output_base_dir: str = "./outputs",
 ):
     if only_load_models:
         # dummy values if we only want to load models
@@ -41,22 +48,25 @@ def main(
     width = 768
 
     # kwargs dicts
-    common_denoiser_kwargs = {
+    common_denoiser_kwargs: dict[str, Any] = {
         "height": height,
         "width": width,
         "num_inference_steps": num_inference_steps,
     }
-    search_denoiser_kwargs = {
+    search_denoiser_kwargs: dict[str, Any] = {
         **common_denoiser_kwargs,
         "num_inference_steps": num_search_inference_steps,
     }
-    final_denoiser_kwargs = {
+    final_denoiser_kwargs: dict[str, Any] = {
         **common_denoiser_kwargs,
         "num_images_per_prompt": num_images_per_prompt,
     }
     if use_paradigms:
         final_denoiser_kwargs["parallel"] = paradigms_parallel
         final_denoiser_kwargs["tolerance"] = paradigms_tolerance
+
+    # normalize directorh path to remove trailing slash
+    output_base_dir = output_base_dir.rstrip("/")
 
     model = StableDiffusionModel(distributed=not only_load_models)
     print("Loaded model")
@@ -73,9 +83,15 @@ def main(
         search_denoiser,
         verifier,
         denoising_steps=num_search_inference_steps,
-        num_samples=num_search_samples // n_ranks,
+        # divide by number of ranks if not load balanced
+        num_samples=(
+            num_search_samples
+            if load_balance_search
+            else num_search_samples // n_ranks
+        ),
         max_batch_size=32,
         distributed=not only_load_models,
+        output_base_dir=output_base_dir,
     )
     print("Loaded searcher")
 
@@ -90,10 +106,18 @@ def main(
     # print(torch.cuda.memory_summary(utils.device.DEVICE))
     # print(torch.cuda.memory_summary(0))
 
-    # initialize all communicators at the very beginning
-    # NOTE: can be used to eliminate communication setup as a potential issue when debugging
-    # comm_warmup()
+    # initialize all communicators at the very beginning;
+    # necessary to avoid nonblocking initialization of communicators for asynchronous calls
+    comm_warmup()
 
+    # initialize output folders
+    print("Communicating I/O parameters...")
+    output_dir = searcher.communicate_io_params()
+    search_intermediate_image_path = f"{output_dir}/search"
+    final_denoise_intermediate_image_path = f"{output_dir}/final_denoise"
+    final_images_path = f"{output_dir}/final_images"
+
+    stream = torch.cuda.current_stream()
     EVENT_search_start = torch.cuda.Event(enable_timing=True)
     EVENT_search_end = torch.cuda.Event(enable_timing=True)
 
@@ -103,16 +127,39 @@ def main(
     with torch.no_grad():
         # search for the initial noise
         print("Searching noise...")
-        EVENT_search_start.record()
-        initial_noise = searcher.search(
-            noise_shape=model.initial_latent_size(
-                num_prompts, num_images_per_prompt, height, width
-            ),
-            prompt=prompt,
-            init_noise_sigma=search_denoiser.scheduler.init_noise_sigma,
-            denoiser_kwargs=search_denoiser_kwargs,
+        EVENT_search_start.record(stream)
+        noise_shape = model.initial_latent_size(
+            num_prompts, num_images_per_prompt, height, width
         )
-        EVENT_search_end.record()
+        if load_balance_search:
+            if cur_rank == 0:
+                (initial_noise_scores, initial_noise) = searcher.search_manager(
+                    batch_size=load_balance_batch_size, noise_shape=noise_shape
+                )
+                print("final scores", initial_noise_scores)
+            else:
+                searcher.search_worker(
+                    noise_shape=noise_shape,
+                    prompt=prompt,
+                    init_noise_sigma=search_denoiser.scheduler.init_noise_sigma,
+                    denoiser_kwargs=search_denoiser_kwargs,
+                    output_folder=(
+                        search_intermediate_image_path
+                        if save_intermediate_images
+                        else None
+                    ),
+                )
+        else:
+            initial_noise = searcher.search(
+                noise_shape=noise_shape,
+                prompt=prompt,
+                init_noise_sigma=search_denoiser.scheduler.init_noise_sigma,
+                denoiser_kwargs=search_denoiser_kwargs,
+                output_folder=(
+                    search_intermediate_image_path if save_intermediate_images else None
+                ),
+            )
+        EVENT_search_end.record(stream)
 
         # broadcast the best initial noise across all GPUs
         # dist.broadcast(initial_noise, src=0)
@@ -120,22 +167,30 @@ def main(
         try_barrier(device=utils.device.DEVICE)
 
         # TODO: parallelize denoising across the GPUs
-        if dist.get_rank() == 0:
+        if cur_rank == 0:
             print("Performing final denoise...")
             # generate the output given the initial noise
-            EVENT_denoise_start.record()
+            EVENT_denoise_start.record(stream)
             denoised = final_denoiser.denoise(
-                initial_noise, prompt, save_intermediate_path="./output", **final_denoiser_kwargs
+                initial_noise,
+                prompt,
+                intermediate_image_path=(
+                    final_denoise_intermediate_image_path
+                    if save_intermediate_images
+                    else None
+                ),
+                **final_denoiser_kwargs,
             )
-            EVENT_denoise_end.record()
+            EVENT_denoise_end.record(stream)
 
             print(denoised)
 
+            # make final images directory
+            os.makedirs(final_images_path, exist_ok=True)
             for idx, image in enumerate(denoised):
                 reward = verifier.get_reward(prompt, image)
                 print(f"Image {idx} score:", reward)
-                plt.imshow(image)
-                plt.show()
+                image.save(f"{output_dir}/final_images/image_{idx}_score{reward}.png")
         else:
             if isinstance(final_denoiser, ParadigmsDenoiser):
                 print("Launching worker thread...")
@@ -185,47 +240,80 @@ def comm_warmup():
         dist.barrier()
 
     dist.barrier()
+    print(f"Warmup done for rank {cur_rank}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
 
-    parser.add_argument(
+    diffusion_params = parser.add_argument_group("Diffusion parameters")
+    diffusion_params.add_argument(
         "--prompt", type=str, default="a beautiful castle, matte painting"
     )
-    parser.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=100,
-        help="Number of inference steps for final denoising",
-    )
-    parser.add_argument(
+
+    search_params = parser.add_argument_group("Search parameters")
+    search_params.add_argument(
         "--num-search-inference-steps",
         type=int,
         default=10,
         help="Number of inference steps for search denoising",
     )
-    parser.add_argument(
+    search_params.add_argument(
         "--num-search-samples",
         type=int,
         default=2,
         help="Total number of search samples (evenly distributed among processes)",
     )
+    search_params.add_argument(
+        "--load-balance-search",
+        action="store_true",
+        help="Use load balancing in the search procedure.",
+    )
+    search_params.add_argument(
+        "--load-balance-batch-size",
+        type=int,
+        default=4,
+        help="Batch size to use when load balancing. Has no effect if `--load-balance-search` is not provided.",
+    )
 
-    parser.add_argument(
+    inference_params = parser.add_argument_group("Final inference parameters")
+    inference_params.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=100,
+        help="Number of inference steps for final denoising",
+    )
+
+    output_params = parser.add_argument_group("Output parameters")
+    output_params.add_argument(
+        "--save-intermediate-images",
+        action="store_true",
+        help="Save intermediate images in the denoising process",
+    )
+    output_params.add_argument(
+        "--output-dir",
+        type=str,
+        default="./outputs",
+        help="Base directory for output files",
+    )
+
+    paradigms_params = parser.add_argument_group("ParaDiGMS parameters")
+    paradigms_params.add_argument(
         "--use-paradigms",
         action="store_true",
         help="Whether to use paradigms as the final denoiser",
     )
-    parser.add_argument(
+    paradigms_params.add_argument(
         "--paradigms-parallel",
         type=int,
         default=16,
         help="Parallelism for paradigms denoiser",
     )
-    parser.add_argument(
+    paradigms_params.add_argument(
         "--paradigms-tolerance",
         type=float,
         default=0.05,
@@ -236,6 +324,13 @@ if __name__ == "__main__":
         "--only-load-models",
         action="store_true",
         help="Exit immediately after loading models. Useful to ensure that models are cached.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Base seed for randomness; each rank is initialized with `SEED + rank`",
     )
 
     args = parser.parse_args()
@@ -255,14 +350,14 @@ if __name__ == "__main__":
         )
     else:
         # initialize distributed workers
-        rank, n_ranks = init_workers()
-        print(f"Initialized rank {rank} out of {n_ranks}")
+        cur_rank, n_ranks = init_workers()
+        print(f"Initialized rank {cur_rank} out of {n_ranks}")
 
         # initialize the current device
         utils.device.init(distributed=True)
 
-        torch.manual_seed(SEED + rank)
-        print(f"Using seed {SEED + rank}")
+        torch.manual_seed(args.seed + cur_rank)
+        print(f"Using seed {args.seed + cur_rank}")
 
         try_barrier(device=utils.device.DEVICE)
 
@@ -273,10 +368,14 @@ if __name__ == "__main__":
                 num_inference_steps=args.num_inference_steps,
                 num_search_inference_steps=args.num_search_inference_steps,
                 num_search_samples=args.num_search_samples,
+                load_balance_search=args.load_balance_search,
+                load_balance_batch_size=args.load_balance_batch_size,
                 use_paradigms=args.use_paradigms,
                 paradigms_parallel=args.paradigms_parallel,
                 paradigms_tolerance=args.paradigms_tolerance,
                 only_load_models=args.only_load_models,
+                save_intermediate_images=args.save_intermediate_images,
+                output_base_dir=args.output_dir,
             )
         finally:
             # always destroy workers when finished

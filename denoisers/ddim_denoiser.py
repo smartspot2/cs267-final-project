@@ -1,3 +1,4 @@
+import os
 from typing import Any, List, Optional, Union
 
 import torch
@@ -50,7 +51,7 @@ class DDIMDenoiser(Denoiser):
         #     Union[Callable[[int, int, dict], None], PipelineCallback, MultiPipelineCallbacks]
         # ] = None,
         # callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        save_intermediate_path: Optional[str] = None,
+        intermediate_image_path: Optional[str] = None,
         # **kwargs,
     ):
         """
@@ -72,8 +73,7 @@ class DDIMDenoiser(Denoiser):
             ip_adapter_image_embeds=None,
             callback_on_step_end_tensor_inputs=None,
         )
-        self.save_intermediate_images = True if save_intermediate_path is not None else False
-        self.save_intermediate_path = save_intermediate_path    
+        save_intermediate_images = intermediate_image_path is not None
 
         # self._guidance_scale = guidance_scale
         # self._guidance_rescale = guidance_rescale
@@ -176,9 +176,10 @@ class DDIMDenoiser(Denoiser):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         # self._num_timesteps = len(timesteps)
-        if self.save_intermediate_images:
-            images = []
-        
+
+        # intermediate images (empty if not saving any images)
+        images = []
+
         with Progress(*progress_columns()) as progress_bar:
             task_id = progress_bar.add_task(
                 description="Performing inference", total=num_inference_steps
@@ -232,11 +233,11 @@ class DDIMDenoiser(Denoiser):
                     return_dict=False,
                 )
 
-                if self.save_intermediate_images:
+                if save_intermediate_images:
                     image = self.model.decode_image(final_x0)[0]
                     image = self.model.postprocess_image(image)
                     images.append((t, image))
-                    # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")   
+                    # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")
                     # # save the image
                     # image[0].save(save_path)
 
@@ -264,12 +265,11 @@ class DDIMDenoiser(Denoiser):
                 # if XLA_AVAILABLE:
                 #     xm.mark_step()
 
-        if self.save_intermediate_images:
-            import os
+        if save_intermediate_images:
             # create the output folder if it doesn't exist
-            os.makedirs(self.save_intermediate_path, exist_ok=True)
+            os.makedirs(intermediate_image_path, exist_ok=True)
             for i, (t, image) in enumerate(images):
-                save_path = os.path.join(self.save_intermediate_path, f"image_t_{t}.png")   
+                save_path = os.path.join(intermediate_image_path, f"image_t_{t}.png")
                 # save the image
                 image[0].save(save_path)
 

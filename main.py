@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -16,20 +16,30 @@ DEFAULT_SEED = 0x280
 
 
 def main(
+    # diffusion parameters
     prompt="a beautiful castle, matte painting",
+    # inference parameters
     num_inference_steps=100,
+    # search parameters
     num_search_inference_steps=20,
-    # total number of search samples among all processes
     num_search_samples=16,
     load_balance_search=True,
     load_balance_batch_size=4,
+    early_stop_timestep: Optional[float] = None,
+    early_stop_dynamic: Optional[str] = None,
+    early_stop_dynamic_threshold: float = 1,
+    early_stop_dynamic_window: int = 5,
+    early_stop_dynamic_timestep_start: int = 900,
+    # paradigms parameters
     use_paradigms=True,
-    # parallelism for paradigms denoiser
     paradigms_parallel=16,
     paradigms_tolerance=0.05,
-    only_load_models=False,
+    # output parameters
     save_intermediate_images=False,
-    output_base_dir: str = "./outputs",
+    output_base_dir="./outputs",
+    # misc parameters
+    only_load_models=False,
+    verbose=False,
 ):
     if only_load_models:
         # dummy values if we only want to load models
@@ -52,10 +62,17 @@ def main(
         "height": height,
         "width": width,
         "num_inference_steps": num_inference_steps,
+        "verbose": verbose,
     }
     search_denoiser_kwargs: dict[str, Any] = {
         **common_denoiser_kwargs,
         "num_inference_steps": num_search_inference_steps,
+        "early_stop": early_stop_timestep,
+        # early_stop_verifier is set later after the verifier is loaded
+        "early_stop_dynamic_method": early_stop_dynamic,
+        "early_stop_dynamic_threshold": early_stop_dynamic_threshold,
+        "early_stop_dynamic_window": early_stop_dynamic_window,
+        "early_stop_dynamic_timestep_start": early_stop_dynamic_timestep_start,
     }
     final_denoiser_kwargs: dict[str, Any] = {
         **common_denoiser_kwargs,
@@ -85,15 +102,16 @@ def main(
         denoising_steps=num_search_inference_steps,
         # divide by number of ranks if not load balanced
         num_samples=(
-            num_search_samples
-            if load_balance_search
-            else num_search_samples // n_ranks
+            num_search_samples if load_balance_search else num_search_samples // n_ranks
         ),
         max_batch_size=32,
         distributed=not only_load_models,
         output_base_dir=output_base_dir,
     )
     print("Loaded searcher")
+
+    if early_stop_dynamic is not None:
+        search_denoiser_kwargs["early_stop_verifier"] = verifier
 
     torch.cuda.empty_cache()
 
@@ -280,6 +298,37 @@ if __name__ == "__main__":
         help="Batch size to use when load balancing. Has no effect if `--load-balance-search` is not provided.",
     )
 
+    search_params.add_argument(
+        "--early-stop-timestep",
+        type=float,
+        default=None,
+        help="Timestep for fixed early stop",
+    )
+    search_params.add_argument(
+        "--early-stop-dynamic",
+        choices=["variance", "range"],
+        default=None,
+        help="Enable dynamic early stop, specifying the type of dynamic early stopping",
+    )
+    search_params.add_argument(
+        "--early-stop-dynamic-threshold",
+        type=float,
+        default=1,
+        help="Threshold for dynamic stopping. Has no effect if `--early-stop-dynamic` is not provided.",
+    )
+    search_params.add_argument(
+        "--early-stop-dynamic-window",
+        type=int,
+        default=5,
+        help="Window for computing the criteria for dynamic stopping. Has no effect if `--early-stop-dynamic` is not provided.",
+    )
+    search_params.add_argument(
+        "--early-stop-dynamic-timestep-start",
+        type=float,
+        default=900,
+        help="Timestep to start checking for dynamic stopping; this ensures the initial plateau in image quality does not trigger an early stop",
+    )
+
     inference_params = parser.add_argument_group("Final inference parameters")
     inference_params.add_argument(
         "--num-inference-steps",
@@ -294,10 +343,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Save intermediate images in the denoising process",
     )
+
+    scratch_dir = os.environ.get("SCRATCH")
+    if scratch_dir is not None:
+        default_output_dir = scratch_dir.rstrip("/") + "/outputs"
+    else:
+        default_output_dir = "./outputs"
     output_params.add_argument(
         "--output-dir",
         type=str,
-        default="./outputs",
+        default=default_output_dir,
         help="Base directory for output files",
     )
 
@@ -325,6 +380,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Exit immediately after loading models. Useful to ensure that models are cached.",
     )
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     parser.add_argument(
         "--seed",
@@ -347,6 +403,7 @@ if __name__ == "__main__":
             use_paradigms=args.use_paradigms,
             paradigms_parallel=args.paradigms_parallel,
             only_load_models=args.only_load_models,
+            verbose=args.verbose,
         )
     else:
         # initialize distributed workers
@@ -364,18 +421,30 @@ if __name__ == "__main__":
         try:
             # run main function
             main(
+                # diffusion parameters
                 prompt=args.prompt,
+                # inference parameters
                 num_inference_steps=args.num_inference_steps,
+                # search parameters
                 num_search_inference_steps=args.num_search_inference_steps,
                 num_search_samples=args.num_search_samples,
                 load_balance_search=args.load_balance_search,
                 load_balance_batch_size=args.load_balance_batch_size,
+                early_stop_timestep=args.early_stop_timestep,
+                early_stop_dynamic=args.early_stop_dynamic,
+                early_stop_dynamic_threshold=args.early_stop_dynamic_threshold,
+                early_stop_dynamic_window=args.early_stop_dynamic_window,
+                early_stop_dynamic_timestep_start=args.early_stop_dynamic_timestep_start,
+                # paradigms parameters
                 use_paradigms=args.use_paradigms,
                 paradigms_parallel=args.paradigms_parallel,
                 paradigms_tolerance=args.paradigms_tolerance,
-                only_load_models=args.only_load_models,
+                # output parameters
                 save_intermediate_images=args.save_intermediate_images,
                 output_base_dir=args.output_dir,
+                # misc parameters
+                only_load_models=args.only_load_models,
+                verbose=args.verbose,
             )
         finally:
             # always destroy workers when finished

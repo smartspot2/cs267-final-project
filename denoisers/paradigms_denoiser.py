@@ -47,6 +47,7 @@ class ParadigmsDenoiser(Denoiser):
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
         full_return: bool = False,
         intermediate_image_path: Optional[str] = None,
+        verbose: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -121,7 +122,8 @@ class ParadigmsDenoiser(Denoiser):
         # TODO: no intermediate image saving for now (paradigms not used in search)
         del intermediate_image_path
 
-        print("parallel pipeline!", flush=True)
+        if verbose:
+            print("parallel pipeline!", flush=True)
         cur_rank = dist.get_rank()
         n_ranks = dist.get_world_size()
         assert cur_rank == 0, "Main paradigms manager node must be run on rank 0"
@@ -339,7 +341,8 @@ class ParadigmsDenoiser(Denoiser):
                 # NOTE: cross_attention_kwargs not communicated
 
             # wait on tensor send requests
-            print("Waiting on send requests...")
+            if verbose:
+                print("Waiting on send requests...")
             for req in send_requests:
                 req.wait()
 
@@ -349,7 +352,8 @@ class ParadigmsDenoiser(Denoiser):
                 recv_requests.append(dist.irecv(model_outputs[idx], rank))
 
             # wait on all receives to finish
-            print("Waiting on recv requests...")
+            if verbose:
+                print("Waiting on recv requests...")
             for req in recv_requests:
                 req.wait()
 
@@ -447,13 +451,15 @@ class ParadigmsDenoiser(Denoiser):
 
         latents = latents_time_evolution_buffer[-1]
 
-        print("pass count", stats_pass_count)
-        print("flop count", stats_flop_count)
+        if verbose:
+            print("pass count", stats_pass_count)
+            print("flop count", stats_flop_count)
 
         end.record()
 
         # stop all workers (send all zeroes as the first shape)
-        print("Stopping workers...")
+        if verbose:
+            print("Stopping workers...")
         send_requests = []
         for rank in range(1, n_ranks):
             send_requests.append(
@@ -465,8 +471,9 @@ class ParadigmsDenoiser(Denoiser):
         # Waits for everything to finish running
         torch.cuda.synchronize()
 
-        print(start.elapsed_time(end))
-        print("done", flush=True)
+        if verbose:
+            print(start.elapsed_time(end))
+            print("done", flush=True)
 
         stats = {
             "pass_count": stats_pass_count,
@@ -543,13 +550,15 @@ class ParadigmsDenoiser(Denoiser):
         image = self.model.decode_image(latents)[0]
         image = self.model.postprocess_image(image)
         # return image, stats
-        print(stats)
-        print(image)
+        if verbose:
+            print(stats)
+            print(image)
         return image
 
     def worker(
         self,
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
+        verbose: bool = False,
     ):
         """
         Worker thread for paradigms.
@@ -570,11 +579,13 @@ class ParadigmsDenoiser(Denoiser):
             # (parallel, batch, channels, features)
             block_prompt_embeds_shape = torch.zeros(4, dtype=torch.int, device=device)
 
-            print("Worker receiving shapes...")
+            if verbose:
+                print("Worker receiving shapes...")
             dist.recv(latent_model_input_shape, 0)
             if (latent_model_input_shape == 0).all():
                 # stop if we receive all zeroes
-                print("Exiting...")
+                if verbose:
+                    print("Exiting...")
                 return
 
             dist.recv(t_vec_shape, 0)
@@ -593,12 +604,14 @@ class ParadigmsDenoiser(Denoiser):
             )
 
             # then receive actual tensors
-            print("Worker receiving tensors...")
+            if verbose:
+                print("Worker receiving tensors...")
             dist.recv(latent_model_input, 0)
             dist.recv(t_vec, 0)
             dist.recv(block_prompt_embeds, 0)
 
-            print("Running model...")
+            if verbose:
+                print("Running model...")
 
             # run the model on the given inputs
             model_output = self.model.forward(

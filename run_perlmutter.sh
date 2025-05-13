@@ -7,6 +7,19 @@ set -o xtrace
 srun -l -u python main.py \
     --num-search-samples 12 \
     --load-balance-search \
-    --load-balance-batch-size 4 \
+    --num-search-inference-steps 200 \
     --use-paradigms \
+    --early-stop-dynamic variance \
+    --early-stop-dynamic-threshold 0.1 \
+    --early-stop-dynamic-window 25 \
+    --early-stop-dynamic-timestep-start 900 \
+    --save-intermediate-images \
+    --verbose \
     | tee out.log
+
+# srun -l -u python main.py \
+#     --num-search-samples 12 \
+#     --load-balance-search \
+#     --load-balance-batch-size 4 \
+#     --use-paradigms \
+#     | tee out.log

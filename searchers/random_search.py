@@ -68,12 +68,18 @@ class RandomSearch(Searcher):
             **kwargs,
         }
 
-        with open(f"{output_folder}/metadata.json", "w") as f:
+        if "early_stop_verifier" in metadata:
+            metadata["early_stop_verifier"] = kwargs["early_stop_verifier"].__class__.__name__
+
+        with open(f"{output_folder}/metadata.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
     @torch.no_grad()
     def search_manager(
-        self, batch_size: int, noise_shape: tuple[int, ...]
+        self,
+        batch_size: int,
+        noise_shape: tuple[int, ...],
+        verbose: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Manages parallel search with dynamic load balancing.
@@ -154,9 +160,6 @@ class RandomSearch(Searcher):
                     )  # samples should always be > 0, since samples_processed < num_samples
 
                     # send continue signal
-                    print(
-                        f"Sent signal to rank {rank} to process {cur_samples} samples"
-                    )
                     send_request = dist.isend(
                         torch.tensor(
                             [cur_samples], dtype=torch.int, device=utils.device.DEVICE
@@ -164,9 +167,12 @@ class RandomSearch(Searcher):
                         rank,
                     )
                     # then optimistically send receive request
-                    print(f"Sent optimistic receive request to rank {rank}")
                     recv_request = dist.irecv(temp_buffers_by_rank[rank], rank)
-                    print(f"Finished with requests")
+
+                    if verbose:
+                        print(
+                            f"Sent signal to rank {rank} to process {cur_samples} samples"
+                        )
 
                     # store requests
                     requests_by_rank[rank]["send"] = send_request
@@ -175,8 +181,10 @@ class RandomSearch(Searcher):
                     samples_processed += batch_size
                 elif not sent_stop_to_rank[rank]:
                     # no more sapmles left to process, send stop signal (if not already sent)
-                    print(f"Sent stop signal to rank {rank}")
                     send_request = dist.isend(STOP_SIGNAL, rank)
+
+                    if verbose:
+                        print(f"Sent stop signal to rank {rank}")
 
                     requests_by_rank[rank]["send"] = send_request
                     sent_stop_to_rank[rank] = True
@@ -186,7 +194,9 @@ class RandomSearch(Searcher):
                 break
 
         # wait for all send requests to complete
-        print("Waiting for send requests to complete")
+        if verbose:
+            print("Waiting for send requests to complete")
+
         for rank in range(1, n_ranks):
             send_request = requests_by_rank[rank]["send"]
             if send_request is not None:
@@ -244,9 +254,6 @@ class RandomSearch(Searcher):
         for request in pending_requests:
             request.wait()
 
-        print(collected_scores)
-        print(collected_noises)
-
         # concatenate scores and noises together
         collected_scores = torch.cat(
             [
@@ -271,8 +278,9 @@ class RandomSearch(Searcher):
         sorted_pairs = sorted(pairs, key=lambda t: t[0], reverse=True)
         best_pairs = sorted_pairs[:final_batch_size]
 
-        print("Best scores:")
-        print([t[0] for t in best_pairs])
+        if verbose:
+            print("Best scores:")
+            print([t[0] for t in best_pairs])
 
         # convert back to stacked tensors
         best_scores = torch.tensor(
@@ -359,6 +367,7 @@ class RandomSearch(Searcher):
         init_noise_sigma: float = 1,
         denoiser_kwargs: Optional[dict[str, Any]] = None,
         output_folder: Optional[str] = None,
+        verbose: bool = False,
     ) -> tuple[str, torch.Tensor]:
         """
         Generates N random samples of noise, and picks the best K according to the verifier.
@@ -415,6 +424,7 @@ class RandomSearch(Searcher):
             tqdm(
                 candidate_noises.split(self.max_batch_size),
                 desc="Searching over noises",
+                disable=not verbose,
             )
         ):
             print(noise_batch.shape)
@@ -440,7 +450,8 @@ class RandomSearch(Searcher):
                 score = self.verifier.get_reward(prompt, image)
                 # store using numpy to avoid using more GPU memory
                 scores.append((score, noise))
-                print(score)
+                if verbose:
+                    print(score)
 
                 # Save the verified intermediate image
                 if save_intermediate_images:
@@ -464,8 +475,9 @@ class RandomSearch(Searcher):
         sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
         best_scores = sorted_scores[:batch_size]
 
-        print("Best scores:")
-        print([t[0] for t in best_scores])
+        if verbose:
+            print("Best scores:")
+            print([t[0] for t in best_scores])
         best_noises = [t[1] for t in best_scores]
 
         if not self.distributed:
@@ -503,7 +515,8 @@ class RandomSearch(Searcher):
             gathered_scores = torch.cat(gathered_scores)
             gathered_noises = torch.cat(gathered_noises)
 
-            print("Gathered scores", gathered_scores)
+            if verbose:
+                print("Gathered scores", gathered_scores)
 
             scores = [
                 (score.item(), noise)
@@ -514,8 +527,9 @@ class RandomSearch(Searcher):
             ]
 
             sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
-            print("Best scores:")
-            print([t[0] for t in sorted_scores[:batch_size]])
+            if verbose:
+                print("Best scores:")
+                print([t[0] for t in sorted_scores[:batch_size]])
             best_noises = [t[1] for t in sorted_scores[:batch_size]]
 
             return torch.stack(best_noises, dim=0)
@@ -535,7 +549,8 @@ class RandomSearch(Searcher):
         init_noise_sigma: float = 1,
         denoiser_kwargs: Optional[dict[str, Any]] = None,
         output_folder: Optional[str] = None,
-    ) -> tuple[str, torch.Tensor]:
+        verbose: bool = False,
+    ) -> None:
         """
         Generates N random samples of noise, and picks the best K according to the verifier.
 
@@ -587,7 +602,8 @@ class RandomSearch(Searcher):
 
             # check to see what the batch size should be
             num_samples: int = manager_signal.item()
-            print(f"Received signal to process {num_samples} samples")
+            if verbose:
+                print(f"Received signal to process {num_samples} samples")
 
             if num_samples == 0:
                 # no samples, abort loop
@@ -597,7 +613,8 @@ class RandomSearch(Searcher):
             noise_batch = self.generate_noise(new_noise_shape, init_noise_sigma)
 
             # for each candidate noise, pass it through the model to evaluate
-            print(noise_batch.shape)
+            if verbose:
+                print("noise shape", noise_batch.shape)
 
             denoised = self.denoiser.denoise(
                 noise_batch,
@@ -620,7 +637,8 @@ class RandomSearch(Searcher):
                 score = self.verifier.get_reward(prompt, image)
                 # store using numpy to avoid using more GPU memory
                 scores.append((score, noise))
-                print(score)
+                if verbose:
+                    print(score)
 
                 # Save the verified intermediate image
                 if save_intermediate_images:
@@ -648,7 +666,9 @@ class RandomSearch(Searcher):
 
         if len(scores) == 0:
             # nothing processed
-            print("Nothing processed")
+            if verbose:
+                print("Nothing processed")
+
             dist.send(
                 torch.tensor([0], dtype=torch.int, device=utils.device.DEVICE), dst=0
             )
@@ -657,8 +677,9 @@ class RandomSearch(Searcher):
         sorted_scores = sorted(scores, key=lambda t: t[0], reverse=True)
         best_scores = sorted_scores[:final_batch_size]
 
-        print("Best scores:")
-        print([t[0] for t in best_scores])
+        if verbose:
+            print("Best scores:")
+            print([t[0] for t in best_scores])
 
         # if distributed, then we need to gather and get the k largest again
         cur_rank_noises_np = np.stack([noise for (_, noise) in best_scores], axis=0)

@@ -1,14 +1,18 @@
+import json
 import os
-from typing import Any, List, Optional, Union
+from typing import Any, Optional, Union, cast
 
+import numpy as np
 import torch
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from PIL.Image import Image
 from rich.progress import Progress
 
 import utils.cache
 import utils.device
 from models.base import PretrainedModel
 from utils.log import progress_columns
+from verifiers.base import Verifier
 
 from .base import Denoiser
 
@@ -52,6 +56,13 @@ class DDIMDenoiser(Denoiser):
         # ] = None,
         # callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         intermediate_image_path: Optional[str] = None,
+        early_stop: Optional[float] = None,
+        early_stop_verifier: Optional[Verifier] = None,
+        early_stop_dynamic_method: Optional[str] = None,
+        early_stop_dynamic_threshold: Optional[float] = None,
+        early_stop_dynamic_window: Optional[int] = None,
+        early_stop_dynamic_timestep_start: Optional[float] = None,
+        verbose: bool = False,
         # **kwargs,
     ):
         """
@@ -59,6 +70,16 @@ class DDIMDenoiser(Denoiser):
 
         All parameters taken directly from the StableDiffusionPipeline `__call__` method,
         with a few parameters omitted for simplicity.
+
+        `early_stop`:
+            None if no early stop, or any number >= 0 for fixed timestep early stop.
+            Here, timestep ranges from [0, 1000], in reverse order.
+            This means that the denoising process stops when the current timestep
+            drops strictly below the early stop timestep.
+
+        `early_stop_verifier`:
+            None if no dynamic early stop, or an instance of the Verifier class
+            to enable dynamic early stop.
         """
         # 1. Check inputs. Raise error if not correct
         self.model.pipeline.check_inputs(
@@ -74,6 +95,18 @@ class DDIMDenoiser(Denoiser):
             callback_on_step_end_tensor_inputs=None,
         )
         save_intermediate_images = intermediate_image_path is not None
+        dynamic_early_stop = early_stop_verifier is not None
+        if dynamic_early_stop:
+            assert (
+                early_stop_dynamic_method is not None
+            ), "Dynamic early stop enabled, but no method specified"
+            assert early_stop_dynamic_method in (
+                "variance",
+                "range",
+            ), "Unrecognized dynamic early stop method"
+            assert (
+                early_stop_dynamic_threshold is not None
+            ), "Dynamic early stop enabled, but no threshold specified"
 
         # self._guidance_scale = guidance_scale
         # self._guidance_rescale = guidance_rescale
@@ -178,15 +211,72 @@ class DDIMDenoiser(Denoiser):
         # self._num_timesteps = len(timesteps)
 
         # intermediate images (empty if not saving any images)
-        images = []
+        intermediate_data: list[tuple[float, list[Image]]] = []
+        intermediate_scores: list[list[float]] = []
 
-        with Progress(*progress_columns()) as progress_bar:
+        early_stop_mask = np.full((latents.shape[0],), True)
+        early_stop_latents = torch.zeros_like(latents)
+        early_stop_timestep = torch.zeros(
+            early_stop_mask.shape, dtype=torch.long, device=utils.device.DEVICE
+        )
+
+        with Progress(*progress_columns(), disable=not verbose) as progress_bar:
             task_id = progress_bar.add_task(
                 description="Performing inference", total=num_inference_steps
             )
             for i, t in enumerate(timesteps):
                 # if self.interrupt:
                 #     continue
+                if early_stop is not None and torch.all(t < early_stop):
+                    break
+
+                if dynamic_early_stop:
+                    assert early_stop_dynamic_method is not None
+                    assert early_stop_dynamic_window is not None
+                    assert early_stop_dynamic_threshold is not None
+
+                    # take into account the starting timestep for considering dynamic stopping
+                    too_early = (
+                        early_stop_dynamic_timestep_start is not None
+                        and torch.all(t >= early_stop_dynamic_timestep_start)
+                    )
+                    # only consider dynamic stop if we have enough scores
+                    enough_scores = (
+                        len(intermediate_scores) >= early_stop_dynamic_window
+                    )
+
+                    if not too_early and enough_scores:
+                        # (window, batch) array of scores
+                        latest_intermediate_scores = np.array(intermediate_scores)[
+                            -early_stop_dynamic_window:, :
+                        ]
+
+                        # stop criteria is computed along axis 0 (within a batch, across the window)
+                        if early_stop_dynamic_method == "variance":
+                            stop_criteria = np.std(latest_intermediate_scores, axis=0)
+                        elif early_stop_dynamic_method == "range":
+                            stop_criteria = np.max(
+                                latest_intermediate_scores, axis=0
+                            ) - np.min(latest_intermediate_scores, axis=0)
+                        else:
+                            raise ValueError("Invalid dynamic early stop method")
+
+                        should_stop = stop_criteria < early_stop_dynamic_threshold
+
+                        newly_stopped = np.bitwise_and(early_stop_mask, should_stop)
+                        early_stop_timestep[newly_stopped] = t
+
+                        # mask is 1 if we keep going, so mask & ~should_stop gives the updated mask
+                        early_stop_mask = np.bitwise_and(early_stop_mask, ~should_stop)
+
+                        if verbose:
+                            print("stop criteria:", stop_criteria)
+                            print("stop mask:", early_stop_mask)
+                            print("stop timesteps:", early_stop_timestep)
+
+                        if np.all(~early_stop_mask):
+                            # stop loop if threshold is met for all latents in the batch
+                            break
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input: torch.Tensor = (
@@ -233,13 +323,28 @@ class DDIMDenoiser(Denoiser):
                     return_dict=False,
                 )
 
-                if save_intermediate_images:
-                    image = self.model.decode_image(final_x0)[0]
-                    image = self.model.postprocess_image(image)
-                    images.append((t, image))
-                    # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")
-                    # # save the image
-                    # image[0].save(save_path)
+                # save final_x0 as the early stop latents as necessary
+                # the mask ensures that we do not overwrite items that have stopped earlier
+                early_stop_latents[early_stop_mask] = final_x0[early_stop_mask]
+
+                if dynamic_early_stop or save_intermediate_images:
+                    images = self.model.decode_image(final_x0)[0]
+                    images = self.model.postprocess_image(images)
+
+                    if save_intermediate_images:
+                        # t is always a single number
+                        intermediate_data.append((t.item(), images))
+                        # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")
+                        # # save the image
+                        # image[0].save(save_path)
+
+                    if dynamic_early_stop:
+                        cur_scores = []
+                        for cur_prompt, cur_image in zip(prompt, images):
+                            cur_scores.append(
+                                early_stop_verifier.get_reward(cur_prompt, cur_image)
+                            )
+                        intermediate_scores.append(cur_scores)
 
                 # if callback_on_step_end is not None:
                 #     callback_kwargs = {}
@@ -266,12 +371,44 @@ class DDIMDenoiser(Denoiser):
                 #     xm.mark_step()
 
         if save_intermediate_images:
+            print("Saving intermediate images...")
             # create the output folder if it doesn't exist
             os.makedirs(intermediate_image_path, exist_ok=True)
-            for i, (t, image) in enumerate(images):
-                save_path = os.path.join(intermediate_image_path, f"image_t_{t}.png")
-                # save the image
-                image[0].save(save_path)
+            for i, (t, images) in enumerate(intermediate_data):
+                if len(images) == 1:
+                    image = images[0]
+                    save_path = os.path.join(intermediate_image_path, f"image_t{t}.png")
+                    image.save(save_path)
+                else:
+                    # save each image individually
+                    for idx, image in enumerate(images):
+                        save_path = os.path.join(
+                            intermediate_image_path, f"image_idx{idx}_t{t}.png"
+                        )
+                        image.save(save_path)
+
+            # save scores to the intermediate image path as well
+            if dynamic_early_stop:
+                save_path = os.path.join(intermediate_image_path, "image_scores.json")
+                json_obj = {
+                    "scores": {},
+                    "stop_timestep": utils.device.to_numpy(
+                        early_stop_timestep
+                    ).tolist(),
+                }
+                for (t, _), scores in zip(intermediate_data, intermediate_scores):
+                    assert (
+                        t not in json_obj
+                    ), f"Duplicate timestep in intermediate data: {intermediate_data}"
+
+                    json_obj["scores"][t] = scores
+
+                with open(save_path, "w", encoding="utf-8") as save_file:
+                    json.dump(json_obj, save_file, indent=2)
+
+        if early_stop is not None or dynamic_early_stop:
+            # if we stopped early, use the final projected latents from the early stop instead
+            latents = early_stop_latents
 
         image = self.model.decode_image(
             latents,  # scaling factor is taken into account within the model

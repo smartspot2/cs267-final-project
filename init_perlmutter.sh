@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-set -o xtrace
-
 module load python/3.12
 module load gpu
 module load pytorch

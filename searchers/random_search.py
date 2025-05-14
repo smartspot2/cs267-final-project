@@ -69,7 +69,9 @@ class RandomSearch(Searcher):
         }
 
         if "early_stop_verifier" in metadata:
-            metadata["early_stop_verifier"] = kwargs["early_stop_verifier"].__class__.__name__
+            metadata["early_stop_verifier"] = kwargs[
+                "early_stop_verifier"
+            ].__class__.__name__
 
         with open(f"{output_folder}/metadata.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
@@ -169,22 +171,20 @@ class RandomSearch(Searcher):
                     # then optimistically send receive request
                     recv_request = dist.irecv(temp_buffers_by_rank[rank], rank)
 
-                    if verbose:
-                        print(
-                            f"Sent signal to rank {rank} to process {cur_samples} samples"
-                        )
-
                     # store requests
                     requests_by_rank[rank]["send"] = send_request
                     requests_by_rank[rank]["recv"] = recv_request
 
                     samples_processed += batch_size
+
+                    print(
+                        f"Sent signal to rank {rank} to process {cur_samples} samples ({self.num_samples - samples_processed} left)"
+                    )
                 elif not sent_stop_to_rank[rank]:
                     # no more sapmles left to process, send stop signal (if not already sent)
                     send_request = dist.isend(STOP_SIGNAL, rank)
 
-                    if verbose:
-                        print(f"Sent stop signal to rank {rank}")
+                    print(f"Sent stop signal to rank {rank}")
 
                     requests_by_rank[rank]["send"] = send_request
                     sent_stop_to_rank[rank] = True
@@ -368,6 +368,7 @@ class RandomSearch(Searcher):
         denoiser_kwargs: Optional[dict[str, Any]] = None,
         output_folder: Optional[str] = None,
         verbose: bool = False,
+        disable_progress_bars: bool = False,
     ) -> tuple[str, torch.Tensor]:
         """
         Generates N random samples of noise, and picks the best K according to the verifier.
@@ -418,21 +419,24 @@ class RandomSearch(Searcher):
         new_noise_shape = (self.num_samples, *noise_shape_rest)
         candidate_noises = self.generate_noise(new_noise_shape, init_noise_sigma)
 
+        split_candidate_noises = candidate_noises.split(self.max_batch_size)
+
         # for each candidate noise, pass it through the model to evaluate
         scores = []
         for batch_idx, noise_batch in enumerate(
             tqdm(
-                candidate_noises.split(self.max_batch_size),
+                split_candidate_noises,
                 desc="Searching over noises",
-                disable=not verbose,
+                disable=not verbose or disable_progress_bars,
             )
         ):
             print(noise_batch.shape)
+            is_last_batch = batch_idx == len(split_candidate_noises) - 1
 
             denoised = self.denoiser.denoise(
                 noise_batch,
                 prompt,
-                intermediate_image_path=intermediate_images_folder,
+                save_intermediate_images=is_last_batch and save_intermediate_images,
                 **denoiser_kwargs,
                 # number of images per prompt should match the noise batch size
                 num_images_per_prompt=noise_batch.shape[0],
@@ -619,11 +623,15 @@ class RandomSearch(Searcher):
             denoised = self.denoiser.denoise(
                 noise_batch,
                 prompt,
-                intermediate_image_path=intermediate_images_folder,
+                save_intermediate_images=save_intermediate_images,
                 **denoiser_kwargs,
                 # number of images per prompt should match the noise batch size
                 num_images_per_prompt=noise_batch.shape[0],
             )
+            if intermediate_images_folder is not None:
+                self.denoiser.save_latest_intermediates(
+                    intermediate_images_folder, save_images=False, batch_idx=batch_idx
+                )
 
             # convert to numpy to conserve on GPU memory
             noise_batch_np = utils.device.to_numpy(noise_batch)
@@ -634,24 +642,27 @@ class RandomSearch(Searcher):
             # print(torch.cuda.memory_summary(utils.device.DEVICE))
 
             for img_idx, (noise, image) in enumerate(zip(noise_batch_np, denoised)):
+                if verbose:
+                    print(f"Running verifier {img_idx+1}/{len(denoised)}...")
                 score = self.verifier.get_reward(prompt, image)
                 # store using numpy to avoid using more GPU memory
                 scores.append((score, noise))
                 if verbose:
-                    print(score)
+                    print(f"Score for index {img_idx}", score)
 
                 # Save the verified intermediate image
-                if save_intermediate_images:
-                    plt.figure(figsize=(10, 10))
-                    plt.imshow(image)
-                    plt.title(f"Score: {score:.4f}")
-                    plt.axis("off")
-
-                    img_path = self.get_image_path(
-                        intermediate_images_folder, batch_idx, img_idx, score
-                    )
-                    plt.savefig(img_path)
-                    plt.close()
+                # if save_intermediate_images:
+                #     plt.figure(figsize=(4, 4))
+                #     plt.imshow(image)
+                #     plt.title(f"Score: {score:.4f}")
+                #     plt.axis("off")
+                #     plt.tight_layout()
+                #
+                #     img_path = self.get_image_path(
+                #         intermediate_images_folder, batch_idx, img_idx, score
+                #     )
+                #     plt.savefig(img_path)
+                #     plt.close()
 
             del denoised
             torch.cuda.empty_cache()
@@ -660,6 +671,8 @@ class RandomSearch(Searcher):
             dist.send(
                 torch.tensor([0], dtype=torch.int, device=utils.device.DEVICE), dst=0
             )
+
+            batch_idx += 1
 
         # print("Memory after denoise:")
         # print(torch.cuda.memory_summary(utils.device.DEVICE))

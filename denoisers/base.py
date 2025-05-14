@@ -1,5 +1,5 @@
 import abc
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -19,11 +19,19 @@ class Denoiser(abc.ABC):
         width: int,
         num_images_per_prompt: int = 1,
         num_inference_steps: int = 50,
-        save_intermediate_path: str = None,
+        save_intermediate_path: Optional[str] = None,
         **kwargs,
     ):
         """
         Given initial parameters (noise, text conditioning, etc.),
         denoises the input using the provided model.
         """
-        return NotImplemented
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def save_latest_intermediates(
+        self,
+        intermediate_image_path: str,
+        **kwargs
+    ) -> None:
+        raise NotImplementedError

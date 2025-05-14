@@ -46,8 +46,10 @@ class ParadigmsDenoiser(Denoiser):
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
         full_return: bool = False,
-        intermediate_image_path: Optional[str] = None,
+        save_intermediate_images: bool = False,
+        image_decode_step: int = 1,
         verbose: bool = False,
+        disable_progress_bars: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -120,7 +122,7 @@ class ParadigmsDenoiser(Denoiser):
         """
 
         # TODO: no intermediate image saving for now (paradigms not used in search)
-        del intermediate_image_path
+        del save_intermediate_images
 
         if verbose:
             print("parallel pipeline!", flush=True)
@@ -634,6 +636,10 @@ class ParadigmsDenoiser(Denoiser):
 
             # finally, send the model output back to the manager node
             dist.send(model_output, 0)
+
+    def save_latest_intermediates(self, intermediate_image_path: str):
+        """No saving intermediates yet."""
+        return
 
 
 class ParaDDPMScheduler(DDPMScheduler):

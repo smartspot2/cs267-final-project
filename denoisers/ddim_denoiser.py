@@ -28,6 +28,9 @@ class DDIMDenoiser(Denoiser):
             model.model_id, subfolder="scheduler", cache_dir=utils.cache.CACHE_DIR
         )
 
+        self.latest_image_data = []
+        self.latest_image_scores = []
+
     def denoise(
         self,
         latents: torch.Tensor,
@@ -55,14 +58,16 @@ class DDIMDenoiser(Denoiser):
         #     Union[Callable[[int, int, dict], None], PipelineCallback, MultiPipelineCallbacks]
         # ] = None,
         # callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        intermediate_image_path: Optional[str] = None,
+        save_intermediate_images: bool = False,
         early_stop: Optional[float] = None,
         early_stop_verifier: Optional[Verifier] = None,
         early_stop_dynamic_method: Optional[str] = None,
         early_stop_dynamic_threshold: Optional[float] = None,
         early_stop_dynamic_window: Optional[int] = None,
         early_stop_dynamic_timestep_start: Optional[float] = None,
+        image_decode_step: int = 1,
         verbose: bool = False,
+        disable_progress_bars: bool = False,
         # **kwargs,
     ):
         """
@@ -80,6 +85,11 @@ class DDIMDenoiser(Denoiser):
         `early_stop_verifier`:
             None if no dynamic early stop, or an instance of the Verifier class
             to enable dynamic early stop.
+
+        `image_decode_step`:
+            Only decode intermediate latents into images every K steps.
+            This saves on computation time, so that we do not decode images
+            at every single denoising step.
         """
         # 1. Check inputs. Raise error if not correct
         self.model.pipeline.check_inputs(
@@ -94,7 +104,6 @@ class DDIMDenoiser(Denoiser):
             ip_adapter_image_embeds=None,
             callback_on_step_end_tensor_inputs=None,
         )
-        save_intermediate_images = intermediate_image_path is not None
         dynamic_early_stop = early_stop_verifier is not None
         if dynamic_early_stop:
             assert (
@@ -211,16 +220,20 @@ class DDIMDenoiser(Denoiser):
         # self._num_timesteps = len(timesteps)
 
         # intermediate images (empty if not saving any images)
-        intermediate_data: list[tuple[float, list[Image]]] = []
-        intermediate_scores: list[list[float]] = []
+        # this is saved as an instance variable to separate the I/O
+        self.latest_image_data: list[tuple[float, list[Image]]] = []
+        self.latest_image_scores: list[list[float]] = []
 
         early_stop_mask = np.full((latents.shape[0],), True)
-        early_stop_latents = torch.zeros_like(latents)
         early_stop_timestep = torch.zeros(
             early_stop_mask.shape, dtype=torch.long, device=utils.device.DEVICE
         )
+        early_stop_latents = torch.zeros_like(latents)
+        early_stop_images: list[Optional[Image]] = [None] * latents.shape[0]
 
-        with Progress(*progress_columns(), disable=not verbose) as progress_bar:
+        with Progress(
+            *progress_columns(), disable=not verbose or disable_progress_bars
+        ) as progress_bar:
             task_id = progress_bar.add_task(
                 description="Performing inference", total=num_inference_steps
             )
@@ -242,12 +255,12 @@ class DDIMDenoiser(Denoiser):
                     )
                     # only consider dynamic stop if we have enough scores
                     enough_scores = (
-                        len(intermediate_scores) >= early_stop_dynamic_window
+                        len(self.latest_image_scores) >= early_stop_dynamic_window
                     )
 
                     if not too_early and enough_scores:
                         # (window, batch) array of scores
-                        latest_intermediate_scores = np.array(intermediate_scores)[
+                        latest_intermediate_scores = np.array(self.latest_image_scores)[
                             -early_stop_dynamic_window:, :
                         ]
 
@@ -261,7 +274,10 @@ class DDIMDenoiser(Denoiser):
                         else:
                             raise ValueError("Invalid dynamic early stop method")
 
-                        should_stop = stop_criteria < early_stop_dynamic_threshold
+                        should_stop = np.bitwise_and(
+                            ~np.isnan(stop_criteria),
+                            stop_criteria < early_stop_dynamic_threshold,
+                        )
 
                         newly_stopped = np.bitwise_and(early_stop_mask, should_stop)
                         early_stop_timestep[newly_stopped] = t
@@ -270,9 +286,9 @@ class DDIMDenoiser(Denoiser):
                         early_stop_mask = np.bitwise_and(early_stop_mask, ~should_stop)
 
                         if verbose:
-                            print("stop criteria:", stop_criteria)
-                            print("stop mask:", early_stop_mask)
-                            print("stop timesteps:", early_stop_timestep)
+                            print(f"[{t}] stop criteria:", stop_criteria)
+                            print(f"[{t}] stop mask:", early_stop_mask)
+                            print(f"[{t}] stop timesteps:", early_stop_timestep)
 
                         if np.all(~early_stop_mask):
                             # stop loop if threshold is met for all latents in the batch
@@ -327,24 +343,50 @@ class DDIMDenoiser(Denoiser):
                 # the mask ensures that we do not overwrite items that have stopped earlier
                 early_stop_latents[early_stop_mask] = final_x0[early_stop_mask]
 
-                if dynamic_early_stop or save_intermediate_images:
-                    images = self.model.decode_image(final_x0)[0]
-                    images = self.model.postprocess_image(images)
+                if (
+                    (dynamic_early_stop or save_intermediate_images)
+                    and i % image_decode_step == 0
+                    and (
+                        # if timestep start is specified, only start scoring after the threshold
+                        early_stop_dynamic_timestep_start is None
+                        or torch.all(t < early_stop_dynamic_timestep_start)
+                    )
+                ):
+                    if dynamic_early_stop and not np.all(early_stop_mask):
+                        images = []
+                        for idx, cur_final_x0 in enumerate(final_x0):
+                            if early_stop_mask[idx]:
+                                cur_image = self.model.decode_image(
+                                    cur_final_x0.unsqueeze(0)
+                                )[0]
+                                cur_image = self.model.postprocess_image(cur_image)[0]
+                                images.append(cur_image)
+                                early_stop_images[idx] = cur_image
+                            else:
+                                images.append(None)
+                    else:
+                        images = self.model.decode_image(final_x0)[0]
+                        images = self.model.postprocess_image(images)
 
-                    if save_intermediate_images:
-                        # t is always a single number
-                        intermediate_data.append((t.item(), images))
-                        # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")
-                        # # save the image
-                        # image[0].save(save_path)
+                    # t is always a single number
+                    self.latest_image_data.append((t.item(), images))
+                    # save_path = os.path.join(self.save_latent_images, f"image_t_{t}.png")
+                    # # save the image
+                    # image[0].save(save_path)
 
                     if dynamic_early_stop:
                         cur_scores = []
-                        for cur_prompt, cur_image in zip(prompt, images):
-                            cur_scores.append(
-                                early_stop_verifier.get_reward(cur_prompt, cur_image)
-                            )
-                        intermediate_scores.append(cur_scores)
+                        for idx, (cur_prompt, cur_image) in enumerate(
+                            zip(prompt, images)
+                        ):
+                            if early_stop_mask[idx]:
+                                score = early_stop_verifier.get_reward(
+                                    cur_prompt, cur_image
+                                )
+                            else:
+                                score = np.nan
+                            cur_scores.append(score)
+                        self.latest_image_scores.append(cur_scores)
 
                 # if callback_on_step_end is not None:
                 #     callback_kwargs = {}
@@ -370,58 +412,30 @@ class DDIMDenoiser(Denoiser):
                 # if XLA_AVAILABLE:
                 #     xm.mark_step()
 
-        if save_intermediate_images:
-            print("Saving intermediate images...")
-            # create the output folder if it doesn't exist
-            os.makedirs(intermediate_image_path, exist_ok=True)
-            for i, (t, images) in enumerate(intermediate_data):
-                if len(images) == 1:
-                    image = images[0]
-                    save_path = os.path.join(intermediate_image_path, f"image_t{t}.png")
-                    image.save(save_path)
-                else:
-                    # save each image individually
-                    for idx, image in enumerate(images):
-                        save_path = os.path.join(
-                            intermediate_image_path, f"image_idx{idx}_t{t}.png"
-                        )
-                        image.save(save_path)
-
-            # save scores to the intermediate image path as well
-            if dynamic_early_stop:
-                save_path = os.path.join(intermediate_image_path, "image_scores.json")
-                json_obj = {
-                    "scores": {},
-                    "stop_timestep": utils.device.to_numpy(
-                        early_stop_timestep
-                    ).tolist(),
-                }
-                for (t, _), scores in zip(intermediate_data, intermediate_scores):
-                    assert (
-                        t not in json_obj
-                    ), f"Duplicate timestep in intermediate data: {intermediate_data}"
-
-                    json_obj["scores"][t] = scores
-
-                with open(save_path, "w", encoding="utf-8") as save_file:
-                    json.dump(json_obj, save_file, indent=2)
-
         if early_stop is not None or dynamic_early_stop:
-            # if we stopped early, use the final projected latents from the early stop instead
-            latents = early_stop_latents
+            # if we stopped early, use the final projected images from the early stop instead
+            images = early_stop_images
 
-        image = self.model.decode_image(
-            latents,  # scaling factor is taken into account within the model
-        )[0]
-        # image, has_nsfw_concept = self.run_safety_checker(
-        #     image, device, prompt_embeds.dtype
-        # )
+            for idx, cur_image in enumerate(images):
+                if cur_image is None:
+                    cur_image = self.model.decode_image(
+                        early_stop_latents[idx].unsqueeze(0)
+                    )[0]
+                    cur_image = self.model.postprocess_image(cur_image)[0]
+                    images[idx] = cur_image
+        else:
+            images = self.model.decode_image(
+                latents,  # scaling factor is taken into account within the model
+            )[0]
+            # image, has_nsfw_concept = self.run_safety_checker(
+            #     image, device, prompt_embeds.dtype
+            # )
 
-        # if has_nsfw_concept is None:
-        #     do_denormalize = [True] * image.shape[0]
-        # else:
-        #     do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-        image = self.model.postprocess_image(image)
+            # if has_nsfw_concept is None:
+            #     do_denormalize = [True] * image.shape[0]
+            # else:
+            #     do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+            images = self.model.postprocess_image(images)
 
         # Offload all models
         self.model.pipeline.maybe_free_model_hooks()
@@ -433,4 +447,69 @@ class DDIMDenoiser(Denoiser):
         #     images=image, nsfw_content_detected=has_nsfw_concept
         # )
 
-        return image
+        return images
+
+    def save_latest_intermediates(
+        self,
+        intermediate_image_path: str,
+        save_images: bool = True,
+        save_scores: bool = True,
+        batch_idx: int = -1,
+    ):
+        """
+        Save the most recent intermediate images and scores.
+        """
+        if len(self.latest_image_data) > 0 and save_images:
+            # create the output folder if it doesn't exist
+            os.makedirs(intermediate_image_path, exist_ok=True)
+            print(f"Saving intermediate images to {intermediate_image_path}...")
+            for t, images in self.latest_image_data:
+                if len(images) == 1 and images[0] is not None:
+                    image = images[0]
+                    save_path = os.path.join(
+                        intermediate_image_path, f"image_batch{batch_idx}_t{t}.png"
+                    )
+                    image.save(save_path)
+                else:
+                    # save each image individually
+                    for idx, image in enumerate(images):
+                        if image is None:
+                            continue
+
+                        save_path = os.path.join(
+                            intermediate_image_path,
+                            f"image_batch{batch_idx}_idx{idx}_t{t}.png",
+                        )
+                        image.save(save_path)
+
+        # save scores to the intermediate image path as well
+        if len(self.latest_image_scores) > 0 and save_scores:
+            assert len(self.latest_image_data) == len(self.latest_image_scores)
+
+            save_path = os.path.join(
+                intermediate_image_path, f"image_scores_batch{batch_idx}.json"
+            )
+            print(f"Saving intermediate scores to {save_path}...")
+
+            image_scores = np.array(self.latest_image_scores)
+            nans = np.isnan(image_scores)
+            # find index of first NaNs along each column (across timesteps)
+            first_nan_idx = np.where(nans.any(axis=0), nans.argmax(axis=0), -1)
+            # convert index into timestep
+            early_stop_timestep = [
+                self.latest_image_data[idx][0] for idx in first_nan_idx
+            ]
+
+            json_obj = {
+                "scores": {},
+                "stop_timestep": early_stop_timestep,
+            }
+            for (t, _), scores in zip(self.latest_image_data, self.latest_image_scores):
+                assert (
+                    t not in json_obj
+                ), f"Duplicate timestep in intermediate data: {self.latest_image_data}"
+
+                json_obj["scores"][t] = scores
+
+            with open(save_path, "w", encoding="utf-8") as save_file:
+                json.dump(json_obj, save_file, indent=2)

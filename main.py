@@ -12,7 +12,7 @@ from searchers import NoSearch, RandomSearch
 from utils.distributed import destroy_workers, init_workers, try_barrier
 from verifiers.image_reward import ImageRewardVerifier
 
-DEFAULT_SEED = 0x280
+ROOT_SEED = 0x280
 
 
 def main(
@@ -20,11 +20,12 @@ def main(
     prompt="a beautiful castle, matte painting",
     # inference parameters
     num_inference_steps=100,
+    image_decode_step=5,
     # search parameters
     num_search_inference_steps=20,
     num_search_samples=16,
     load_balance_search=True,
-    load_balance_batch_size=4,
+    search_batch_size=4,
     early_stop_timestep: Optional[float] = None,
     early_stop_dynamic: Optional[str] = None,
     early_stop_dynamic_threshold: float = 1,
@@ -40,6 +41,7 @@ def main(
     # misc parameters
     only_load_models=False,
     verbose=False,
+    disable_progress_bars=False,
 ):
     if only_load_models:
         # dummy values if we only want to load models
@@ -62,7 +64,9 @@ def main(
         "height": height,
         "width": width,
         "num_inference_steps": num_inference_steps,
+        "image_decode_step": image_decode_step,
         "verbose": verbose,
+        "disable_progress_bars": disable_progress_bars,
     }
     search_denoiser_kwargs: dict[str, Any] = {
         **common_denoiser_kwargs,
@@ -104,7 +108,7 @@ def main(
         num_samples=(
             num_search_samples if load_balance_search else num_search_samples // n_ranks
         ),
-        max_batch_size=32,
+        max_batch_size=search_batch_size,
         distributed=not only_load_models,
         output_base_dir=output_base_dir,
     )
@@ -135,6 +139,12 @@ def main(
     final_denoise_intermediate_image_path = f"{output_dir}/final_denoise"
     final_images_path = f"{output_dir}/final_images"
 
+    if cur_rank == 0:
+        # write root seed to output directory
+        os.makedirs(output_dir, exist_ok=True)
+        with open(f"{output_dir}/seed.txt", "w", encoding="utf-8") as f:
+            f.write(str(ROOT_SEED))
+
     stream = torch.cuda.current_stream()
     EVENT_search_start = torch.cuda.Event(enable_timing=True)
     EVENT_search_end = torch.cuda.Event(enable_timing=True)
@@ -152,7 +162,9 @@ def main(
         if load_balance_search:
             if cur_rank == 0:
                 (initial_noise_scores, initial_noise) = searcher.search_manager(
-                    batch_size=load_balance_batch_size, noise_shape=noise_shape
+                    batch_size=search_batch_size,
+                    noise_shape=noise_shape,
+                    verbose=verbose,
                 )
                 print("final scores", initial_noise_scores)
             else:
@@ -166,6 +178,7 @@ def main(
                         if save_intermediate_images
                         else None
                     ),
+                    verbose=verbose,
                 )
         else:
             initial_noise = searcher.search(
@@ -176,8 +189,17 @@ def main(
                 output_folder=(
                     search_intermediate_image_path if save_intermediate_images else None
                 ),
+                verbose=verbose,
+                disable_progress_bars=disable_progress_bars,
             )
         EVENT_search_end.record(stream)
+
+        if save_intermediate_images:
+            searcher.denoiser.save_latest_intermediates(
+                searcher.get_intermediate_images_folder(search_intermediate_image_path),
+                # scores already saved in search workers
+                save_scores=False,
+            )
 
         # broadcast the best initial noise across all GPUs
         # dist.broadcast(initial_noise, src=0)
@@ -192,14 +214,15 @@ def main(
             denoised = final_denoiser.denoise(
                 initial_noise,
                 prompt,
-                intermediate_image_path=(
-                    final_denoise_intermediate_image_path
-                    if save_intermediate_images
-                    else None
-                ),
+                save_intermediate_images=save_intermediate_images,
                 **final_denoiser_kwargs,
             )
             EVENT_denoise_end.record(stream)
+
+            if save_intermediate_images:
+                final_denoiser.save_latest_intermediates(
+                    final_denoise_intermediate_image_path
+                )
 
             print(denoised)
 
@@ -218,13 +241,19 @@ def main(
 
     # must synchronize before computing timings
     torch.cuda.synchronize()
-    print(
-        f"[rank {cur_rank}] Search time {EVENT_search_start.elapsed_time(EVENT_search_end)}ms"
-    )
+
+    search_time = EVENT_search_start.elapsed_time(EVENT_search_end)
+    print(f"[rank {cur_rank}] Search time {search_time}ms")
+    with open(
+        f"{output_dir}/rank{cur_rank}_search_time.txt", "w", encoding="utf-8"
+    ) as f:
+        f.write(str(search_time))
+
     if dist.get_rank() == 0:
-        print(
-            f"[rank {cur_rank}] Denoise time {EVENT_denoise_start.elapsed_time(EVENT_denoise_end)}ms"
-        )
+        denoise_time = EVENT_denoise_start.elapsed_time(EVENT_denoise_end)
+        print(f"[rank {cur_rank}] Denoise time {denoise_time}ms")
+        with open(f"{output_dir}/rank0_denoise_time.txt", "w", encoding="utf-8") as f:
+            f.write(str(denoise_time))
 
 
 def comm_warmup():
@@ -272,30 +301,36 @@ if __name__ == "__main__":
     diffusion_params.add_argument(
         "--prompt", type=str, default="a beautiful castle, matte painting"
     )
+    diffusion_params.add_argument(
+        "--image-decode-step",
+        type=int,
+        default=5,
+        help="Only decode images every K steps, if `--save-intermediate-images` or `--early-stop-dynamic` is specified.",
+    )
 
     search_params = parser.add_argument_group("Search parameters")
     search_params.add_argument(
         "--num-search-inference-steps",
         type=int,
-        default=10,
+        default=100,
         help="Number of inference steps for search denoising",
     )
     search_params.add_argument(
         "--num-search-samples",
         type=int,
-        default=2,
+        default=12,
         help="Total number of search samples (evenly distributed among processes)",
+    )
+    search_params.add_argument(
+        "--search-batch-size",
+        type=int,
+        default=4,
+        help="Maximum batch size to use in search; this is also the batch size used for load balancing",
     )
     search_params.add_argument(
         "--load-balance-search",
         action="store_true",
         help="Use load balancing in the search procedure.",
-    )
-    search_params.add_argument(
-        "--load-balance-batch-size",
-        type=int,
-        default=4,
-        help="Batch size to use when load balancing. Has no effect if `--load-balance-search` is not provided.",
     )
 
     search_params.add_argument(
@@ -341,7 +376,7 @@ if __name__ == "__main__":
     output_params.add_argument(
         "--save-intermediate-images",
         action="store_true",
-        help="Save intermediate images in the denoising process",
+        help="Save intermediate images in the denoising process; note that for search, this only saves the last batch of intermediate images.",
     )
 
     scratch_dir = os.environ.get("SCRATCH")
@@ -381,11 +416,16 @@ if __name__ == "__main__":
         help="Exit immediately after loading models. Useful to ensure that models are cached.",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--disable-progress-bars",
+        action="store_true",
+        help="Disable progress bars, even if `--verbose` is specified",
+    )
 
     parser.add_argument(
         "--seed",
         type=int,
-        default=DEFAULT_SEED,
+        default=ROOT_SEED,
         help="Base seed for randomness; each rank is initialized with `SEED + rank`",
     )
 
@@ -416,6 +456,8 @@ if __name__ == "__main__":
         torch.manual_seed(args.seed + cur_rank)
         print(f"Using seed {args.seed + cur_rank}")
 
+        ROOT_SEED = args.seed
+
         try_barrier(device=utils.device.DEVICE)
 
         try:
@@ -425,11 +467,12 @@ if __name__ == "__main__":
                 prompt=args.prompt,
                 # inference parameters
                 num_inference_steps=args.num_inference_steps,
+                image_decode_step=args.image_decode_step,
                 # search parameters
                 num_search_inference_steps=args.num_search_inference_steps,
                 num_search_samples=args.num_search_samples,
                 load_balance_search=args.load_balance_search,
-                load_balance_batch_size=args.load_balance_batch_size,
+                search_batch_size=args.search_batch_size,
                 early_stop_timestep=args.early_stop_timestep,
                 early_stop_dynamic=args.early_stop_dynamic,
                 early_stop_dynamic_threshold=args.early_stop_dynamic_threshold,
@@ -445,6 +488,7 @@ if __name__ == "__main__":
                 # misc parameters
                 only_load_models=args.only_load_models,
                 verbose=args.verbose,
+                disable_progress_bars=args.disable_progress_bars,
             )
         finally:
             # always destroy workers when finished

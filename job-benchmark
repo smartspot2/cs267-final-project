@@ -1,0 +1,10 @@
+#!/bin/bash
+#SBATCH -N 4
+#SBATCH -C gpu
+#SBATCH -A mp309
+#SBATCH -t 02:30:00
+#SBATCH -q regular
+#SBATCH --gpus-per-node=4
+
+source ./init_perlmutter.sh
+./benchmark.sh

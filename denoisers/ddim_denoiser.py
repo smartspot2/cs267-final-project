@@ -285,7 +285,10 @@ class DDIMDenoiser(Denoiser):
                         # mask is 1 if we keep going, so mask & ~should_stop gives the updated mask
                         early_stop_mask = np.bitwise_and(early_stop_mask, ~should_stop)
 
-                        if verbose:
+                        if verbose and (i - 1) % image_decode_step == 0:
+                            print(
+                                f"[{t}] last scores:", latest_intermediate_scores[-1, :]
+                            )
                             print(f"[{t}] stop criteria:", stop_criteria)
                             print(f"[{t}] stop mask:", early_stop_mask)
                             print(f"[{t}] stop timesteps:", early_stop_timestep)
